@@ -1,0 +1,13 @@
+# structures and derived data — regenerable, and large
+*.cif
+*.pdb
+*.pdbqt
+*.sdf
+*.npz
+*.png
+out_*/
+dock/
+ctrl/
+pep/
+*_results/
+__pycache__/
