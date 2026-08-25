@@ -11,3 +11,5 @@ ctrl/
 pep/
 *_results/
 __pycache__/
+*.yaml
+*_receptor.pdb
