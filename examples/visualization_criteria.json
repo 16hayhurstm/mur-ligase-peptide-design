@@ -1,0 +1,4 @@
+[
+  {"column": "pass_filters", "op": "==", "value": true},
+  {"column": "filter_rmsd_design", "op": "<=", "value": 2.0}
+]

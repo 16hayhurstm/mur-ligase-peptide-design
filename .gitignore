@@ -13,3 +13,12 @@ pep/
 __pycache__/
 *.yaml
 *_receptor.pdb
+
+# Local experiments and portable visualization bundles
+/runs/
+/visualizations/
+*.before-group-fix
+*.bak
+.DS_Store
+# Allow intentionally maintained example YAML configurations
+!examples/*.yaml

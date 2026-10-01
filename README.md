@@ -4,6 +4,34 @@ A workflow for designing peptides against bacterial Mur ligase binding sites wit
 
 Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
 
+## Myles development changes — 1 October 2026
+
+This working version extends Eric's existing workflow and preserves the original
+findings and references below. The source checkout reported upstream commit
+`bdbb9ea`; its existing Git history should be retained when creating a personal
+remote. This review bundle is a patch to that checkout, not a replacement Git
+history or a complete copy of the repository.
+
+Implemented changes:
+
+- `make_spec.py`: nest `binding_types` within the imported `file` entity.
+  Recorded before/after checks marked zero versus the intended 32 MurC pocket
+  residues. This establishes recognised guidance, not improved binders.
+- `map_pocket.py`: remind users to use the mapped receptor chain for preparation.
+- Visualization: small Bash wrapper, separate standard-library Python builder,
+  and separate ChimeraX viewer. Select all, recorded passes, explicit IDs or
+  custom metric criteria; apply deterministic sorting and a default 30-pair cap
+  before copying structures. No eligible designs produces a clear empty report.
+- Optional `--visualize` integration after BoltzGen generation and filtering.
+- Selection provenance, filter summaries and source-file hashes in each bundle.
+
+See [visualization usage and limitations](docs/visualization.md). The original
+20-design viewer was exercised in ChimeraX; the refactored version needs a local
+smoke test. Automated builder tests do not establish molecular correctness.
+Pending: verified pocket residue mapping/highlighting, geometric contacts and
+clashes, diversity selection and on-demand loading. Default BoltzGen filter
+passes do not establish intended-pocket occupancy or experimental binding.
+
 ## What this does
 
 Given a crystal structure with a bound ligand, the pipeline defines the binding pocket from that ligand, generates peptides against it, filters them on where they actually sit, and docks them.
@@ -14,6 +42,7 @@ Given a crystal structure with a bound ligand, the pipeline defines the binding 
 | 2 | `python/map_pocket.py` | pocket residues and docking box from a bound ligand |
 | 3 | `python/make_spec.py` | write a BoltzGen design spec |
 | 4 | `scripts/03_boltzgen_design.sh` | run the design job |
+| 4a (optional) | `scripts/04_visualize_designs.sh` | select and inspect before/after refolding pairs |
 | 5 | `python/occupancy.py` | rank designs by how much sits in the target pocket |
 | 6 | `python/prepare_receptor.py` | strip, repair and convert the receptor |
 | 7 | `scripts/06_prepare_ligands.sh` | build peptides from sequence, convert to PDBQT |
