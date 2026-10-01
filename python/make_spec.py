@@ -13,6 +13,7 @@ the generated spec and confirm the binding site is where you intended.
 import sys
 import os
 
+
 TEMPLATE = """entities:
   - protein:
       id: B
@@ -22,12 +23,12 @@ TEMPLATE = """entities:
       include:
         - chain:
             id: {chain}
-binding_types:
-  - chain:
-      id: {chain}
-      binding: {residues}
+      # Binding guidance belongs to this file entity.
+      binding_types:
+        - chain:
+            id: {chain}
+            binding: {residues}
 """
-
 
 def main():
     if len(sys.argv) < 6:

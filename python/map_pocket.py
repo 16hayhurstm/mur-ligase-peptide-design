@@ -80,6 +80,10 @@ def main():
         print(f"  {num:>5} {name}   {d} A")
     print(f"\nresidues  : {[n for n, _, _ in hits]}")
     print(f"box centre: {[round(float(x), 2) for x in centre]}")
+    print(f"\nIMPORTANT pass chain {prot.name} to prepare_receptor.py.")
+    print(f"          structures with several chains hold one ligand each,")
+    print(f"          and the two scripts can otherwise pick different chains,")
+    print(f"          leaving the docking box outside the receptor.")
     print(f"box size  : {extent.max() + 10:.0f} A "
           f"(ligand extent {[round(float(x), 1) for x in extent]})")
 
