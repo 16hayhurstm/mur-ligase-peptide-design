@@ -1,53 +1,83 @@
-# murligase-peptide-docking
+# murligase-peptide-design
 
-A workflow for designing peptides against bacterial Mur ligase binding sites with BoltzGen, and scoring them with AutoDock Vina.
-
-Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
-
-## Myles development changes — 1 October 2026
-
-This working version extends Eric's existing workflow and preserves the original
-findings and references below. The source checkout reported upstream commit
-`bdbb9ea`; its existing Git history should be retained when creating a personal
-remote. This review bundle is a patch to that checkout, not a replacement Git
-history or a complete copy of the repository.
-
-Implemented changes:
-
-- `make_spec.py`: nest `binding_types` within the imported `file` entity.
-  Recorded before/after checks marked zero versus the intended 32 MurC pocket
-  residues. This establishes recognised guidance, not improved binders.
-- `map_pocket.py`: remind users to use the mapped receptor chain for preparation.
-- Visualization: small Bash wrapper, separate standard-library Python builder,
-  and separate ChimeraX viewer. Select all, recorded passes, explicit IDs or
-  custom metric criteria; apply deterministic sorting and a default 30-pair cap
-  before copying structures. No eligible designs produces a clear empty report.
-- Optional `--visualize` integration after BoltzGen generation and filtering.
-- Selection provenance, filter summaries and source-file hashes in each bundle.
-
-See [visualization usage and limitations](docs/visualization.md). The original
-20-design viewer was exercised in ChimeraX; the refactored version needs a local
-smoke test. Automated builder tests do not establish molecular correctness.
-Pending: verified pocket residue mapping/highlighting, geometric contacts and
-clashes, diversity selection and on-demand loading. Default BoltzGen filter
-passes do not establish intended-pocket occupancy or experimental binding.
+A workflow for designing peptides against a specified site using [BoltzGen](https://github.com/jwohlwend/boltzgen) and scoring them with [AutoDock Vina](https://vina.scripps.edu/). Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
 
 ## What this does
 
-Given a crystal structure with a bound ligand, the pipeline defines the binding pocket from that ligand, generates peptides against it, filters them on where they actually sit, and docks them.
+Given a crystal structure with a bound ligand, the pipeline defines the binding pocket from that ligand, generates peptides against it (checked up to here), filters them on where they actually sit, and docks them.
 
-| step | script | purpose |
+| Step | Script | Purpose |
 |---|---|---|
-| 1 | `scripts/01_fetch_structure.sh` | download a structure from RCSB |
-| 2 | `python/map_pocket.py` | pocket residues and docking box from a bound ligand |
-| 3 | `python/make_spec.py` | write a BoltzGen design spec |
-| 4 | `scripts/03_boltzgen_design.sh` | run the design job |
-| 4a (optional) | `scripts/04_visualize_designs.sh` | select and inspect before/after refolding pairs |
-| 5 | `python/occupancy.py` | rank designs by how much sits in the target pocket |
-| 6 | `python/prepare_receptor.py` | strip, repair and convert the receptor |
-| 7 | `scripts/06_prepare_ligands.sh` | build peptides from sequence, convert to PDBQT |
-| 8 | `python/scramble.py` | composition-matched controls |
-| 9 | `python/dock.py` | multi-seed docking with reproducibility reporting |
+| 1 | `scripts/01_fetch_structure.sh` | Download a structure from RCSB |
+| 2 | `python/map_pocket.py` | Identify residues around a bound ligand and calculate a docking box |
+| 3 | `python/make_spec.py` | Create a BoltzGen design specification targeting the mapped residues |
+| 4 | `scripts/03_boltzgen_design.sh` | Validate the specification, generate peptide designs, and run the BoltzGen pipeline |
+| 4a *(optional)* | `scripts/04_visualize_designs.sh` | Select designs and create a ChimeraX bundle comparing complexes before and after refolding |
+
+---------- Myles Checked up to here
+
+| 5 | `python/occupancy.py` | Rank designs by how much of each peptide occupies the target pocket |
+| 6 | `python/prepare_receptor.py` | Prepare the receptor for docking |
+| 7 | `scripts/06_prepare_ligands.sh` | Build peptide structures from sequences and convert them to PDBQT |
+| 8 | `python/scramble.py` | Generate composition-matched peptide controls |
+| 9 | `python/dock.py` | Run multi-seed docking and report score variability |
+
+
+Visualisation is optional and can also be invoked during design generation with `--visualize`. A filter pass or high rank does not demonstrate pocket occupancy, experimental binding, or inhibition. See [`docs/visualization.md`](docs/visualization.md) for selection options and viewer limitations.
+
+
+## How it works
+
+Start with a structure. Download whatever you're targeting from the PDB:
+
+    ./scripts/01_fetch_structure.sh 1P3D data
+
+Work out where the pocket is. You can't design against a site until you've defined it, and nobody annotates that in a PDB file — you derive it by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
+
+    python python/map_pocket.py data/1P3D.cif UMA 5.0
+
+That prints the pocket residues and a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
+
+Then, design some peptides against it. `make_spec.py` turns the residue list into a BoltzGen spec, and the wrapper runs the job:
+
+    python python/make_spec.py data/1P3D.cif A 25,27,28,29,... 8..16 murc.yaml
+    ./scripts/03_boltzgen_design.sh murc.yaml out_murc 100
+
+Roughly an hour for 100 designs on an A6000. Run it under tmux.
+
+Optionally visualise the results in ChimeraX, using `scripts/04_visualize_designs.sh` to create a viewing folder:
+
+    bash scripts/04_visualize_designs.sh out_murc visualizations/murc --select all --limit 20
+
+This collects up to 20 designs and pairs their structures before and after refolding. Choose a new destination folder for each bundle.
+
+Download the entire `visualizations/murc` folder to your laptop, then open its `compare_refolds.py` file using **File > Open** in a fresh ChimeraX session. Use the **Model Panel** to display one design group at a time: cyan shows the peptide before refolding, magenta shows it after refolding, and grey shows the common MurC reference.
+
+See [docs/visualization.md](docs/visualization.md) for selection options and further viewing instructions.
+
+
+------ Myles Checked up to here
+
+
+Now, find out where the designs actually sit. BoltzGen ranks its own output on a refolded complex that doesn't preserve the designed placement, so rank on measured pocket contact instead:
+
+    python python/occupancy.py out_murc/intermediate_designs 25,27,28,29,...
+
+Prepare the receptor. Crystal structures need cleaning before docking — waters and ligands stripped, modified residues repaired, one chain kept:
+
+    python python/prepare_receptor.py data/1P3D.cif murc A 25,27,28,29,...
+
+Pass the pocket residues and it will warn you if any of them get dropped.
+
+Build the ligands and their controls. Peptides come from sequence via PyMOL, and scrambles give you a composition-matched baseline:
+
+    ./scripts/06_prepare_ligands.sh pep TTDPGFGT $(python python/scramble.py TTDPGFGT 5)
+
+Finally, dock across several seeds. One seed isn't a measurement: the search is stochastic enough that the same peptide can move by nearly a kcal/mol between runs:
+
+    python python/dock.py murc.pdbqt pep 25.69,-5.73,48.55 24
+
+It reports the seed spread next to every mean, and warns when the variation between runs is comparable to the difference between ligands.
 
 ## Quickstart
 
@@ -62,23 +92,6 @@ That prints the pocket residues and a box. Feed the residues to `make_spec.py` t
 
 See `docs/environment.md` for the conda environments and system tools required.
 
-## Read this before trusting any output
-
-The scripts run. Whether their numbers mean anything is a separate question, and on these targets the answer was largely no. Findings from developing this workflow:
-
-**AutoDock Vina failed its redocking control.** Given MurC's own substrate and the correct pocket, it placed it 5.67 Å from the crystallographic position; the accepted threshold is under 2 Å.
-
-**Vina scored that substrate better in the wrong pocket.** UMA docked into MurC's ATP site scored −10.17, against −9.26 in its own substrate site.
-
-**Cross-pocket comparisons are dominated by enclosure, not sequence.** Designed peptides preferred MurC's ATP pocket by 1.38 kcal/mol; scrambles of those peptides preferred it by 1.59. The effect carried no sequence information.
-
-**A validated inhibitor ranked last against its own scrambles.** MurFp1 (IC50 250 µM, Paradis-Bleau et al. 2008) docked into *P. aeruginosa* MurF scored below all five composition-matched shuffles of itself.
-
-**Seed variance is comparable to the signal.** One peptide against one receptor, varying only the random seed, spanned 0.91 kcal/mol; the range across ten different peptides was 1.29. `dock.py` reports this and warns when a ranking is not readable.
-
-**12-mer peptides are outside Vina's range.** They carry 42–43 torsional degrees of freedom against a practical limit near 32.
-
-Composition-matched scrambles were the single most useful control. Two apparent results dissolved on contact with them.
 
 ## Sources
 
