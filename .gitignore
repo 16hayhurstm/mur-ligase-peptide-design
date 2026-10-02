@@ -14,9 +14,9 @@ __pycache__/
 *.yaml
 *_receptor.pdb
 
-# Local experiments and portable visualization bundles
+# Local experiments and portable visualisation bundles
 /runs/
-/visualizations/
+/visualisations/
 *.before-group-fix
 *.bak
 .DS_Store

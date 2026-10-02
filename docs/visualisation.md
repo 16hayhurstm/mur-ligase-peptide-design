@@ -8,34 +8,34 @@ Replace `RUN` with a run folder or BoltzGen output folder, and `DEST` with a new
 
 ```bash
 # Default: all metrics rows eligible, ordered by final_rank; maximum 30 designs
-bash scripts/04_visualize_designs.sh RUN DEST
+bash scripts/04_visualise_designs.sh RUN DEST
 
 # Example: inspect the initial 20-design MurC trial
-bash scripts/04_visualize_designs.sh runs/murc_fixed_20_20260930 visualizations/trial-v2
+bash scripts/04_visualise_designs.sh runs/murc_fixed_20_20260930 visualisations/trial-v2
 
 # Select recorded filter passes
-bash scripts/04_visualize_designs.sh RUN DEST --select passed --limit 30
+bash scripts/04_visualise_designs.sh RUN DEST --select passed --limit 30
 
 # Select an exact design ID
-bash scripts/04_visualize_designs.sh RUN DEST --select ids --ids murc_myles_20260930_fixed_13
+bash scripts/04_visualise_designs.sh RUN DEST --select ids --ids murc_myles_20260930_fixed_13
 
 # Require every custom criterion to pass
-bash scripts/04_visualize_designs.sh RUN DEST --select custom --criteria examples/visualization_criteria.json
+bash scripts/04_visualise_designs.sh RUN DEST --select custom --criteria examples/visualisation_criteria.json
 
 # Sort passing designs by another numeric metric
-bash scripts/04_visualize_designs.sh RUN DEST --select passed --sort-by design_to_target_iptm --descending
+bash scripts/04_visualise_designs.sh RUN DEST --select passed --sort-by design_to_target_iptm --descending
 
 # Check selection and structure-pair availability without writing files
-bash scripts/04_visualize_designs.sh RUN DEST --select passed --dry-run
+bash scripts/04_visualise_designs.sh RUN DEST --select passed --dry-run
 
 # Use an alternative metrics table
-bash scripts/04_visualize_designs.sh RUN DEST --metrics RUN/output/refiltered/final_ranked_designs/all_designs_metrics.csv
+bash scripts/04_visualise_designs.sh RUN DEST --metrics RUN/output/refiltered/final_ranked_designs/all_designs_metrics.csv
 
 # Generate designs, then create a bundle
-bash scripts/03_boltzgen_design.sh SPEC.yaml NEW_OUTPUT 100 --visualize --select passed --limit 30
+bash scripts/03_boltzgen_design.sh SPEC.yaml NEW_OUTPUT 100 --visualise --select passed --limit 30
 ```
 
-Arguments after `--visualize` go to the builder. `--limit 0` removes the cap; use cautiously because all selected pairs load into memory. Selecting `all` does not remove the cap. An empty selection produces summary files without a viewer.
+Arguments after `--visualise` go to the builder. `--limit 0` removes the cap; use cautiously because all selected pairs load into memory. Selecting `all` does not remove the cap. An empty selection produces summary files without a viewer.
 
 ## Selection rules
 

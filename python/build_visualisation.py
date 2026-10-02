@@ -146,7 +146,7 @@ def main(argv=None):
     dest = args.destination.resolve()
     if dest.exists(): raise ValueError(f'Destination exists: {dest}; choose a new directory')
     dest.parent.mkdir(parents=True, exist_ok=True)
-    temp = Path(tempfile.mkdtemp(prefix='.visualization-', dir=dest.parent))
+    temp = Path(tempfile.mkdtemp(prefix='.visualisation-', dir=dest.parent))
     try:
         for pair in pairs:
             for stage in ('before', 'after'):

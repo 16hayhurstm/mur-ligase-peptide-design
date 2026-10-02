@@ -6,12 +6,12 @@
 #
 # Requires the boltzgen conda environment. Run under tmux.
 # Estimate duration from measured local runs, not a fixed GPU runtime.
-# Optional: [num_designs] --visualize [builder selection options]
+# Optional: [num_designs] --visualise [builder selection options]
 
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-    echo "usage: $0 SPEC.yaml OUTDIR [num_designs] [--visualize [selection options]]" >&2
+    echo "usage: $0 SPEC.yaml OUTDIR [num_designs] [--visualise [selection options]]" >&2
     exit 1
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,11 +24,11 @@ if [[ $# -gt 0 && "$1" != --* ]]; then
     shift
 fi
 [[ "$N" =~ ^[1-9][0-9]*$ ]] || { echo "num_designs must be positive" >&2; exit 1; }
-VISUALIZE=false
+VISUALISE=false
 VIS_ARGS=()
 if [[ $# -gt 0 ]]; then
-    [[ "$1" == --visualize ]] || { echo "Unknown argument: $1" >&2; exit 1; }
-    VISUALIZE=true
+    [[ "$1" == --visualise ]] || { echo "Unknown argument: $1" >&2; exit 1; }
+    VISUALISE=true
     shift
     VIS_ARGS=("$@")
 fi
@@ -64,7 +64,7 @@ echo "  $OUTDIR/final_ranked_designs/all_designs_metrics.csv"
 echo "design-stage structures for the occupancy filter:"
 echo "  $OUTDIR/intermediate_designs/"
 
-if [[ "$VISUALIZE" == true ]]; then
-    bash "$SCRIPT_DIR/04_visualize_designs.sh" "$OUTDIR" \
-        "$OUTDIR/visualization" "${VIS_ARGS[@]}"
+if [[ "$VISUALISE" == true ]]; then
+    bash "$SCRIPT_DIR/04_visualise_designs.sh" "$OUTDIR" \
+        "$OUTDIR/visualisation" "${VIS_ARGS[@]}"
 fi

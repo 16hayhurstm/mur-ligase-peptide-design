@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BUILDER = ROOT / 'python/build_visualization.py'
+BUILDER = ROOT / 'python/build_visualisation.py'
 
 class BuilderTests(unittest.TestCase):
     def setUp(self):

@@ -12,7 +12,7 @@ Given a crystal structure with a bound ligand, the pipeline defines the binding 
 | 2 | `python/map_pocket.py` | Identify residues around a bound ligand and calculate a docking box |
 | 3 | `python/make_spec.py` | Create a BoltzGen design specification targeting the mapped residues |
 | 4 | `scripts/03_boltzgen_design.sh` | Validate the specification, generate peptide designs, and run the BoltzGen pipeline |
-| 4a *(optional)* | `scripts/04_visualize_designs.sh` | Select designs and create a ChimeraX bundle comparing complexes before and after refolding |
+| 4a *(optional)* | `scripts/04_visualise_designs.sh` | Select designs and create a ChimeraX bundle comparing complexes before and after refolding |
 
 ---------- Myles Checked up to here
 
@@ -23,7 +23,7 @@ Given a crystal structure with a bound ligand, the pipeline defines the binding 
 | 9 | `python/dock.py` | Run multi-seed docking and report score variability |
 
 
-Visualisation is optional and can also be invoked during design generation with `--visualize`. A filter pass or high rank does not demonstrate pocket occupancy, experimental binding, or inhibition. See [`docs/visualization.md`](docs/visualization.md) for selection options and viewer limitations.
+Visualisation is optional and can also be invoked during design generation with `--visualise`. A filter pass or high rank does not demonstrate pocket occupancy, experimental binding, or inhibition. See [`docs/visualisation.md`](docs/visualisation.md) for selection options and viewer limitations.
 
 
 ## How it works
@@ -45,15 +45,15 @@ Then, design some peptides against it. `make_spec.py` turns the residue list int
 
 Roughly an hour for 100 designs on an A6000. Run it under tmux.
 
-Optionally visualise the results in ChimeraX, using `scripts/04_visualize_designs.sh` to create a viewing folder:
+Optionally visualise the results in ChimeraX, using `scripts/04_visualise_designs.sh` to create a viewing folder:
 
-    bash scripts/04_visualize_designs.sh out_murc visualizations/murc --select all --limit 20
+    bash scripts/04_visualise_designs.sh out_murc visualisations/murc --select all --limit 20
 
 This collects up to 20 designs and pairs their structures before and after refolding. Choose a new destination folder for each bundle.
 
-Download the entire `visualizations/murc` folder to your laptop, then open its `compare_refolds.py` file using **File > Open** in a fresh ChimeraX session. Use the **Model Panel** to display one design group at a time: cyan shows the peptide before refolding, magenta shows it after refolding, and grey shows the common MurC reference.
+Download the entire `visualisations/murc` folder to your laptop, then open its `compare_refolds.py` file using **File > Open** in a fresh ChimeraX session. Use the **Model Panel** to display one design group at a time: cyan shows the peptide before refolding, magenta shows it after refolding, and grey shows the common MurC reference.
 
-See [docs/visualization.md](docs/visualization.md) for selection options and further viewing instructions.
+See [docs/visualisation.md](docs/visualisation.md) for selection options and further viewing instructions.
 
 
 ------ Myles Checked up to here
