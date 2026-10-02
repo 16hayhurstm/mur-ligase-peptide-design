@@ -1,6 +1,6 @@
 # murligase-peptide-design
 
-A workflow for designing peptides against a specified site using [BoltzGen](https://github.com/jwohlwend/boltzgen) and scoring them with [AutoDock Vina](https://vina.scripps.edu/). Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
+A workflow for designing peptides against a specified site using [BoltzGen](https://github.com/HannesStark/boltzgen) and scoring them with [AutoDock Vina](https://vina.scripps.edu/). Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
 
 ## What this does
 
@@ -29,8 +29,11 @@ Visualisation is optional and can also be invoked during design generation with 
 ## How it works
 
 Start with a structure. Download whatever you're targeting from the PDB:
-
+    ./scripts/01_fetch_structure.sh <PDB_ID> <output_directory>
+    Example
     ./scripts/01_fetch_structure.sh 1P3D data
+
+
 
 Work out where the pocket is. You can't design against a site until you've defined it, and nobody annotates that in a PDB file — you derive it by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
 
