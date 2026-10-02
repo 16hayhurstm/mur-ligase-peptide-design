@@ -27,18 +27,23 @@ Visualisation is optional and can also be invoked during design generation with 
 
 
 ## How it works
+Download the structure of whatever you're targeting from the PDB:
+```bash
+# Generic usage
+./scripts/01_fetch_structure.sh <PDB_ID> <output_directory>
 
-Start with a structure. Download whatever you're targeting from the PDB:
-    # Generic usage
-    ./scripts/01_fetch_structure.sh <PDB_ID> <output_directory>
-    # Example used for MurC
-    ./scripts/01_fetch_structure.sh 1P3D data
+# Example used for MurC
+./scripts/01_fetch_structure.sh 1P3D data
+```
+The above saves a PBD_ID.cif which can then be used to identify the binding pocket by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
 
+```bash
+# Generic usage
+python python/map_pocket.py <path_to_structure.cif> <ligand_name> <distance_cutoff>
 
-
-Work out where the pocket is. You can't design against a site until you've defined it, and nobody annotates that in a PDB file — you derive it by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
-
-    python python/map_pocket.py data/1P3D.cif UMA 5.0
+# Example used for MurC
+python python/map_pocket.py data/1P3D.cif UMA 5.0
+```
 
 That prints the pocket residues and a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
 
