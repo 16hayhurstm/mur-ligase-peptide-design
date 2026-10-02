@@ -1,76 +1,80 @@
-# Reproducible visualization and selection
+# Reproducible visualisation and selection
 
-Run from the repository root with Python 3.8+ on Epicac. The builder uses only
-Python's standard library. ChimeraX is needed only on the viewing computer.
+Create a portable ChimeraX bundle to compare peptide complexes before and after refolding. Run from the repository root with Python 3.8+; the builder uses only the standard library. We use Epicac, but it is not required. ChimeraX is needed only for viewing.
+
+## Usage
+
+Replace `RUN` with a run folder or BoltzGen output folder, and `DEST` with a new destination folder. `DEST` must not already exist.
 
 ```bash
-# Inspect all 20 trial designs (default cap: 30; order: final_rank ascending)
+# Default: all metrics rows eligible, ordered by final_rank; maximum 30 designs
+bash scripts/04_visualize_designs.sh RUN DEST
+
+# Example: inspect the initial 20-design MurC trial
 bash scripts/04_visualize_designs.sh runs/murc_fixed_20_20260930 visualizations/trial-v2
-# Only recorded passes; zero passes yields summary files and NO viewer
+
+# Select recorded filter passes
 bash scripts/04_visualize_designs.sh RUN DEST --select passed --limit 30
-# Exact IDs (not abbreviated numbers)
+
+# Select an exact design ID
 bash scripts/04_visualize_designs.sh RUN DEST --select ids --ids murc_myles_20260930_fixed_13
-# All custom predicates must match; missing/nonfinite values fail
+
+# Require every custom criterion to pass
 bash scripts/04_visualize_designs.sh RUN DEST --select custom --criteria examples/visualization_criteria.json
-# Rank by a different numeric metric
+
+# Sort passing designs by another numeric metric
 bash scripts/04_visualize_designs.sh RUN DEST --select passed --sort-by design_to_target_iptm --descending
-# Check selection and selected-pair availability without writing a bundle
+
+# Check selection and structure-pair availability without writing files
 bash scripts/04_visualize_designs.sh RUN DEST --select passed --dry-run
-# Explicitly use another filtering table
+
+# Use an alternative metrics table
 bash scripts/04_visualize_designs.sh RUN DEST --metrics RUN/output/refiltered/final_ranked_designs/all_designs_metrics.csv
-# Optional generation integration (arguments after --visualize go to builder)
+
+# Generate designs, then create a bundle
 bash scripts/03_boltzgen_design.sh SPEC.yaml NEW_OUTPUT 100 --visualize --select passed --limit 30
 ```
 
-`RUN` accepts a run folder or the actual BoltzGen output folder. `DEST` must not
-already exist. `--limit 0` explicitly removes the cap; avoid it for large runs.
-`all` means all metrics rows are eligible, not that the display cap is removed.
-Selection uses CSV `id` and exact `file_name` (or `id.cif` when absent). IDs must
-be unique. Structures absent from the metrics table are not candidates; summary
-counts describe metrics rows, not the originally requested number of designs.
-Unselected missing structures do not block a shortlist. Missing selected pairs
-are errors. No ranked-file prefix stripping and no silent fallbacks are used.
+Arguments after `--visualize` go to the builder. `--limit 0` removes the cap; use cautiously because all selected pairs load into memory. Selecting `all` does not remove the cap. An empty selection produces summary files without a viewer.
 
-Custom JSON is a nonempty list of objects containing `column`, `op`, `value`.
-Operators: `<`, `<=`, `>`, `>=`, `==`, `!=`. Values: finite numbers or booleans;
-booleans permit equality/inequality only. Unknown columns/operators are errors.
-The example reproduces existing criteria; it is NOT a validated hit-selection
-rule. No arbitrary Python expressions are executed. Custom selection does not
-implicitly require `pass_filters`; include that predicate when desired.
+## Selection rules
 
-Ordering is by the specified numeric column, with missing values last and ID
-as a deterministic tie-breaker. Sequence/pose diversity selection is not yet
-implemented. A high rank or filter pass is not evidence of experimental binding.
+Only metrics CSV rows are candidates, so summary counts may differ from the number of designs originally requested. IDs must be unique. Structures are matched using the exact `file_name`, or `id.cif` if absent. Ranked prefixes are not stripped, and there are no silent fallbacks. Missing selected pairs cause errors; missing unselected structures do not.
 
-## Portable folder
+Sorting uses the specified numeric column, with missing values last and ID breaking ties. Sequence and pose diversity selection are not implemented.
 
-The bundle contains `summary.json` (criteria, counts, source CSV hash),
-`selected_metrics.csv`, `manifest.csv` (sources and structure SHA-256 hashes),
-`pairs.json`, selected structure pairs, and `compare_refolds.py` when nonempty.
-Download the WHOLE folder. Open the viewer with File > Open in an empty ChimeraX
-session. It refuses a nonempty session instead of closing existing work.
+Custom criteria are a nonempty JSON list of objects containing `column`, `op` and `value`. Every criterion must pass.
 
-Before = inverse-folded complex immediately preceding refolding; after = its
-`refold_cif` counterpart. These are not the raw diffusion-stage backbones.
-MurC is detected as the sole protein chain with >=200 CA-bearing residues and
-the peptide as the sole chain with 2–100. This heuristic is specific to this
-project, not a sequence-based identity check; ambiguous structures stop loading.
-Each full complex is moved using receptor alignment to the first selected
-pre-refold receptor. Cyan ghost = before; magenta sticks/cartoon = after.
-The common grey receptor is a reference, not every design's actual receptor.
-Use the matching receptor when evaluating clashes. Whole-receptor alignment
-can leave local domain differences. Pocket highlighting and geometric
-contact/clash evaluation are not implemented.
+- Operators: `<`, `<=`, `>`, `>=`, `==`, `!=`.
+- Values: finite numbers or booleans; booleans support only `==` and `!=`.
+- Missing or nonfinite metric values fail.
+- Unknown columns or operators cause errors.
+- Include a `pass_filters` predicate if custom selection should also require recorded filter passes.
+- Arbitrary Python expressions are not executed.
 
-Expand groups and toggle one parent group at a time. Labels report the saved
-`pass_filters` value even when custom selection admits failures. All SELECTED
-pairs load into memory; the cap keeps this practical. On-demand loading is
-not yet implemented. No BoltzGen structures or scores are modified.
+The example JSON reproduces existing criteria; it is not a validated hit-selection rule. A high rank or filter pass does not demonstrate experimental binding.
 
-## Validation status (2026-10-01)
+## Viewing the bundle
 
-The original viewer plus grouping fixes was used by Myles in ChimeraX 1.12.
-The refactored builder is tested using the uploaded real 20-row metrics table
-and synthetic file-pair fixtures. Tests exercise selection/copying, not molecular
-validity. The refactored viewer requires a Mac ChimeraX smoke test; no ChimeraX
-runtime or actual run CIFs were included in the review archive.
+Download the **whole destination folder**. It contains:
+
+- `summary.json`: criteria, counts and source CSV hash.
+- `selected_metrics.csv`: selected metrics.
+- `manifest.csv`: source paths and structure SHA-256 hashes.
+- `pairs.json`: structure-pair information.
+- Selected structure pairs and `compare_refolds.py` for nonempty selections.
+
+Open `compare_refolds.py` through **File → Open** in an empty ChimeraX session. The viewer refuses a nonempty session to protect existing work. Expand model groups and toggle one parent group at a time.
+
+| Display | Meaning |
+|---|---|
+| Cyan ghost | Inverse-folded complex immediately before refolding |
+| Magenta sticks/cartoon | Corresponding `refold_cif` structure |
+| Grey receptor | First selected pre-refold receptor, used as a common reference |
+
+“Before” does not mean the raw diffusion backbone. Each full complex is moved by aligning its receptor to the reference. Use each design’s matching receptor to assess clashes: the grey reference does not represent every receptor, and whole-receptor alignment can leave local domain differences.
+
+MurC is identified as the sole protein chain with at least 200 CA-bearing residues, and the peptide as the sole chain with 2–100. This project-specific heuristic does not verify sequence identity; ambiguous structures stop loading.
+
+Labels show recorded `pass_filters` values, including failures admitted by custom selection. Pocket highlighting, geometric contact/clash analysis and on-demand loading are not implemented. No BoltzGen structures or scores are modified.
+
