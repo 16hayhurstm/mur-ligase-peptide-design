@@ -29,8 +29,9 @@ Visualisation is optional and can also be invoked during design generation with 
 ## How it works
 
 Start with a structure. Download whatever you're targeting from the PDB:
+    # Generic usage
     ./scripts/01_fetch_structure.sh <PDB_ID> <output_directory>
-    Example
+    # Example used for MurC
     ./scripts/01_fetch_structure.sh 1P3D data
 
 
