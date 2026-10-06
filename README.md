@@ -32,20 +32,22 @@ Download the structure of whatever you're targeting from the PDB:
 # Generic usage
 ./scripts/01_fetch_structure.sh <PDB_ID> <output_directory>
 
-# Example used for MurC
+# Example used for MurC (1P3D)
 ./scripts/01_fetch_structure.sh 1P3D data
 ```
-The above saves a PBD_ID.cif which can then be used to identify the binding pocket by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
+The above saves a PBD_ID.cif to the specified output directory which can then be used to identify the binding pocket. This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
 
 ```bash
 # Generic usage
 python python/map_pocket.py <path_to_structure.cif> <ligand_name> <distance_cutoff>
 
-# Example used for MurC
+# Example used for MurC(1P3D), identifiying the UMA binding site deffined at residues within 5 Angstrom
 python python/map_pocket.py data/1P3D.cif UMA 5.0
 ```
 
-That prints the pocket residues and a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
+This prints the pocket residues and a the coordinates of a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
+
+- does this remove the other ligands also?
 
 Then, design some peptides against it. `make_spec.py` turns the residue list into a BoltzGen spec, and the wrapper runs the job:
 
