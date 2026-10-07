@@ -1,14 +1,20 @@
-"""Write a BoltzGen design spec .yaml targeting a set of pocket residues.
+"""Write a BoltzGen design specification (.yaml) targeting pocket residues.
 
 usage:   python make_spec.py STRUCTURE.cif CHAIN RESIDUES LENGTH OUT.yaml
 example: python make_spec.py data/1P3D.cif A 25,27,28,29 8..16 murc.yaml
 
-RESIDUES is the comma-separated list printed by map_pocket.py.
-LENGTH is a BoltzGen range, e.g. 8..16 or 12..18.
+CHAIN is the canonical mmCIF chain identifier (label_asym_id).
+RESIDUES is a comma-separated list of canonical residue indices
+(label_seq_id). Use the chain and residue list labelled "BoltzGen residues"
+in the output from map_pocket.py.
+LENGTH is the peptide length or length range, e.g. 12 or 8..16.
 
-Note that BoltzGen indexes by label_seq_id, which does not always match the
-author numbering that map_pocket.py reports. Always run `boltzgen check` on
-the generated spec and confirm the binding site is where you intended.
+Canonical identifiers can differ from author chain names and residue
+numbers. This script writes the supplied identifiers without converting
+or validating them, so do NOT use the author-numbered list.
+
+Always run `boltzgen check` on the generated specification and inspect
+the resulting structure to confirm that the intended pocket is marked.
 """
 import sys
 import os
