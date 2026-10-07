@@ -56,41 +56,128 @@ def main():
     lig = np.array(lig_xyz)
 
     hits = []
+
     for r in prot:
         if r.name not in AA:
             continue
         if r.name in lig_names or r.seqid.num in lig_nums:
             continue
+
         xyz = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in r])
-        d = float(np.linalg.norm(xyz[:, None] - lig[None, :], axis=-1).min())
+        d = float(
+            np.linalg.norm(xyz[:, None] - lig[None, :], axis=-1).min()
+        )
+
         if d < cutoff:
-            hits.append((r.seqid.num, r.name, round(d, 2)))
-    hits.sort()
+            author_residue_id = str(r.seqid)
+            canonical_residue_index = r.label_seq
+            canonical_chain_id = r.subchain
+
+            if canonical_residue_index is None or canonical_residue_index < 1:
+                raise ValueError(
+                    f"Missing or invalid canonical index for "
+                    f"{prot.name}:{author_residue_id} ({r.name})"
+                )
+
+            if not canonical_chain_id:
+                raise ValueError(
+                    f"Missing canonical chain ID for "
+                    f"{prot.name}:{author_residue_id} ({r.name})"
+                )
+
+            hits.append({
+                "author_residue_id": author_residue_id,
+                "canonical_residue_index": canonical_residue_index,
+                "canonical_chain_id": canonical_chain_id,
+                "residue_name": r.name,
+                "minimum_distance": d,
+            })
+
+    # Sort once, after collecting all pocket residues.
+    hits.sort(
+        key=lambda hit: (
+            hit["canonical_chain_id"],
+            hit["canonical_residue_index"],
+        )
+    )
 
     centre = lig.mean(0)
     extent = lig.max(0) - lig.min(0)
 
     print(f"structure : {path}  ({st.resolution} A)")
-    print(f"protein   : chain {prot.name}, {len(prot_nums)} residues "
-          f"({prot_nums[0]}-{prot_nums[-1]})")
+    print(
+        f"protein   : author chain {prot.name}, {len(prot_nums)} residues "
+        f"({prot_nums[0]}-{prot_nums[-1]})"
+    )
     print(f"ligand    : {','.join(lig_res)}  ({len(lig)} atoms)")
     print(f"cutoff    : {cutoff} A")
     print(f"\npocket: {len(hits)} residues")
-    for num, name, d in hits:
-        print(f"  {num:>5} {name}   {d} A")
-    print(f"\nresidues  : {[n for n, _, _ in hits]}")
-    print(f"box centre: {[round(float(x), 2) for x in centre]}")
-    print(f"\nIMPORTANT pass chain {prot.name} to prepare_receptor.py.")
-    print(f"          structures with several chains hold one ligand each,")
-    print(f"          and the two scripts can otherwise pick different chains,")
-    print(f"          leaving the docking box outside the receptor.")
-    print(f"box size  : {extent.max() + 10:.0f} A "
-          f"(ligand extent {[round(float(x), 1) for x in extent]})")
 
-    mod = [f"{n}{nm}" for n, nm, _ in hits if nm in ("MSE", "KCX")]
-    if mod:
-        print(f"\nNOTE modified residues in pocket: {mod}")
-        print("     these break receptor preparation - see docs")
+    print("  Author chain:residue   Canonical chain:index   Residue   Distance")
+    for hit in hits:
+        author_identifier = f"{prot.name}:{hit['author_residue_id']}"
+        canonical_identifier = (
+            f"{hit['canonical_chain_id']}:{hit['canonical_residue_index']}"
+        )
+        print(
+            f"  {author_identifier:>20}   "
+            f"{canonical_identifier:>21}   "
+            f"{hit['residue_name']:>7}   "
+            f"{hit['minimum_distance']:.2f} A"
+        )
+
+    # Retain author identifiers for comparison with the original structure.
+    author_residue_ids = [
+        hit["author_residue_id"] for hit in hits
+    ]
+    print(
+        f"\nauthor residues, chain {prot.name}: "
+        f"{','.join(author_residue_ids)}"
+    )
+
+    # Report BoltzGen indices separately for each canonical chain.
+    canonical_chain_ids = sorted({
+        hit["canonical_chain_id"] for hit in hits
+    })
+
+    for canonical_chain_id in canonical_chain_ids:
+        canonical_residue_indices = [
+            str(hit["canonical_residue_index"])
+            for hit in hits
+            if hit["canonical_chain_id"] == canonical_chain_id
+        ]
+        print(
+            f"BoltzGen residues, canonical chain {canonical_chain_id}: "
+            f"{','.join(canonical_residue_indices)}"
+        )
+
+    if not hits:
+        print("\nWARNING: no pocket residues found; no BoltzGen list generated.")
+
+    print(f"\nbox centre: {[round(float(x), 2) for x in centre]}")
+    print(
+        f"\nIMPORTANT pass author chain {prot.name} "
+        "to prepare_receptor.py."
+    )
+    print("          structures with several chains hold one ligand each,")
+    print("          and the two scripts can otherwise pick different chains,")
+    print("          leaving the docking box outside the receptor.")
+    print(
+        f"box size  : {extent.max() + 10:.0f} A "
+        f"(ligand extent {[round(float(x), 1) for x in extent]})"
+    )
+
+    modified_residues = [
+        f"{prot.name}:{hit['author_residue_id']} {hit['residue_name']}"
+        for hit in hits
+        if hit["residue_name"] in ("MSE", "KCX")
+    ]
+    if modified_residues:
+        print(
+            f"\nNOTE modified residues in pocket "
+            f"(author identifiers): {modified_residues}"
+        )
+        print("     check their handling during receptor preparation - see docs")
 
 
 if __name__ == "__main__":
