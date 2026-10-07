@@ -35,7 +35,7 @@ Download the structure of whatever you're targeting from the PDB:
 # Example used for MurC (1P3D)
 ./scripts/01_fetch_structure.sh 1P3D data
 ```
-The above saves a PBD_ID.cif to the specified output directory which can then be used to identify the binding pocket. This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
+The above saves a PBD_ID.cif to the specified output directory which can then be used to identify/estimate the binding pocket(s) residues of specified ligands. This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
 
 ```bash
 # Generic usage
@@ -44,17 +44,42 @@ python python/map_pocket.py <path_to_structure.cif> <ligand_name> <distance_cuto
 # Example used for MurC(1P3D), identifiying the UMA binding site deffined at residues within 5 Angstrom
 python python/map_pocket.py data/1P3D.cif UMA 5.0
 ```
-
 This prints the pocket residues and a the coordinates of a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
 
-- does this remove the other ligands also?
 
-Then, design some peptides against it. `make_spec.py` turns the residue list into a BoltzGen spec, and the wrapper runs the job:
 
-    python python/make_spec.py data/1P3D.cif A 25,27,28,29,... 8..16 murc.yaml
-    ./scripts/03_boltzgen_design.sh murc.yaml out_murc 100
+Then make the [design specification] `.yaml` using `make_spec.py` (more detail here (https://github.com/HannesStark/boltzgen/tree/main#how-to-make-a-design-specification-yaml)). *Curent limitation* - this produces a '.yaml' that remove and secondary ligand from the structure.
 
-Roughly an hour for 100 designs on an A6000. Run it under tmux.
+```bash
+# Generic usage
+python python/make_specs.py <path_to_structure.cif> <chain_to_target> <pocket_residue_> <AA_length> <output_file>
+
+# Example used for MurC(1P3D), targetting the UMA binding site with peptides between 8-16AA in length, outputfile = murc.yaml
+python python/make_spec.py data/1P3D.cif A 25,27,28,29,... 8..16 murc.yaml
+```
+Check the design specification is as intended by running:
+
+```bash
+# Generic usage
+boltzgen check <path_to_design specification>
+
+# Example used for murc.yaml
+boltzgen check murc.yaml
+```
+Then visulise the resulting '.cif' file using (https://molstar.org/viewer/) which should show the binding residues a different color. Alternatively programmes such as ChimeraX can be used but require knowlege of the programme to visualise the specified binding residues. Then, design some peptides against it;
+
+```bash
+# Generic usage
+bash scripts/03_boltzgen_design.sh <path_to_design_specification> <output_directory> <number_of_designs>
+
+# Example used for murc.yaml to produce 200 peptides (in practice Boltzgen recomends genrating between 10,000-60,000)
+bash scripts/03_boltzgen_design.sh murc.yaml out_murc 200
+```
+
+
+
+
+Roughly an hour for 100 designs on an A6000. Run it under tmux. - Myles' run took 5.5hr for 200
 
 Optionally visualise the results in ChimeraX, using `scripts/04_visualise_designs.sh` to create a viewing folder:
 
