@@ -46,17 +46,30 @@ python python/map_pocket.py data/1P3D.cif UMA 5.0
 ```
 This prints the pocket residues and a the coordinates of a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
 
+Then create the [BoltzGen design specification](https://github.com/HannesStark/boltzgen/tree/main#how-to-make-a-design-specification-yaml) (`.yaml`) using `make_spec.py`.
 
+Use the chain identifier and residue list labelled **"BoltzGen residues, canonical chain ..."** in the output from `map_pocket.py`. These use the canonical mmCIF identifiers (`label_asym_id` and `label_seq_id`), which may differ from the author identifiers. `make_spec.py` writes the supplied identifiers without converting or validating them.
 
-Then make the [design specification] `.yaml` using `make_spec.py` (more detail here (https://github.com/HannesStark/boltzgen/tree/main#how-to-make-a-design-specification-yaml)). *Curent limitation* - this produces a '.yaml' that remove and secondary ligand from the structure.
+**Current limitation:** the generated specification includes only the selected target chain from the structure. Additional ligands and ions are not explicitly retained. For example, the command below targets the UMA pocket but does not retain bound ANP or manganese ions.
 
 ```bash
-# Generic usage
-python python/make_specs.py <path_to_structure.cif> <chain_to_target> <pocket_residue_> <AA_length> <output_file>
+# Generic usage: CHAIN and RESIDUES must use canonical identifiers.
+python python/make_spec.py STRUCTURE.cif CHAIN RESIDUES LENGTH OUT.yaml
 
-# Example used for MurC(1P3D), targetting the UMA binding site with peptides between 8-16AA in length, outputfile = murc.yaml
-python python/make_spec.py data/1P3D.cif A 25,27,28,29,... 8..16 murc.yaml
+# MurC (1P3D): target the UMA pocket with peptides of 8–16 amino acids.
+python python/make_spec.py data/1P3D.cif A \
+  25,27,28,29,30,31,32,48,49,50,51,70,84,85,86,87,88,91,107,152,173,174,175,177,178,198,346,348,376,377,380,459 \
+  8..16 murc.yaml
 ```
+
+Check the specification before starting a design run:
+
+```bash
+boltzgen check murc.yaml
+```
+
+Inspect the generated check structure to confirm that the intended pocket residues are marked. Successful parsing alone does not confirm that the correct binding site was selected.
+
 Check the design specification is as intended by running:
 
 ```bash

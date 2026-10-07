@@ -7,9 +7,17 @@ usage:   python map_pocket.py STRUCTURE.cif LIGAND [cutoff]
 example: python map_pocket.py data/1P3D.cif UMA 5.0
          python map_pocket.py data/4CVM.cif 1452,1453,1454,1455 5.0
 
+The output reports both author and canonical residue identifiers.
+For BoltzGen, use the chain and residue list labelled "BoltzGen residues":
+these use label_asym_id and label_seq_id from the mmCIF file.
+Author identifiers are retained for comparison with the original structure.
+Missing canonical identifiers in selected pocket residues raise an error.        
+
 LIGAND may be several comma-separated residue names, for structures that
 model a substrate as separate components, e.g. 4CVM stores
 UDP-MurNAc-Ala-Glu as UDP,MUB,ALA,FGA.
+
+
 """
 import sys
 import gemmi
