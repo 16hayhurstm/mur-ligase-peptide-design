@@ -1,4 +1,4 @@
-"""Write a BoltzGen design spec targeting a set of pocket residues.
+"""Write a BoltzGen design spec .yaml targeting a set of pocket residues.
 
 usage:   python make_spec.py STRUCTURE.cif CHAIN RESIDUES LENGTH OUT.yaml
 example: python make_spec.py data/1P3D.cif A 25,27,28,29 8..16 murc.yaml
