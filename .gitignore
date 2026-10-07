@@ -13,7 +13,7 @@ pep/
 __pycache__/
 *.yaml
 *_receptor.pdb
-
+.vscode/
 # Local experiments and portable visualisation bundles
 /runs/
 /visualisations/
