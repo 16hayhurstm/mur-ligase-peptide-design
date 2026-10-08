@@ -2,30 +2,6 @@
 
 A workflow for designing peptides against a specified site using [BoltzGen](https://github.com/HannesStark/boltzgen) and scoring them with [AutoDock Vina](https://vina.scripps.edu/). Developed against *Haemophilus influenzae* MurC (PDB 1P3D) and *Pseudomonas aeruginosa* MurF (4CVM), but the scripts take structures, ligands and residue lists as arguments and are not specific to those targets.
 
-## What this does
-
-Given a crystal structure with a bound ligand, the pipeline defines the binding pocket from that ligand, generates peptides against it (checked up to here), filters them on where they actually sit, and docks them.
-
-| Step | Script | Purpose |
-|---|---|---|
-| 1 | `scripts/01_fetch_structure.sh` | Download a structure from RCSB |
-| 2 | `python/map_pocket.py` | Identify residues around a bound ligand and calculate a docking box |
-| 3 | `python/make_spec.py` | Create a BoltzGen design specification targeting the mapped residues |
-| 4 | `scripts/03_boltzgen_design.sh` | Validate the specification, generate peptide designs, and run the BoltzGen pipeline |
-| 4a *(optional)* | `scripts/04_visualise_designs.sh` | Select designs and create a ChimeraX bundle comparing complexes before and after refolding |
-
----------- Myles Checked up to here
-
-| 5 | `python/occupancy.py` | Rank designs by how much of each peptide occupies the target pocket |
-| 6 | `python/prepare_receptor.py` | Prepare the receptor for docking |
-| 7 | `scripts/06_prepare_ligands.sh` | Build peptide structures from sequences and convert them to PDBQT |
-| 8 | `python/scramble.py` | Generate composition-matched peptide controls |
-| 9 | `python/dock.py` | Run multi-seed docking and report score variability |
-
-
-Visualisation is optional and can also be invoked during design generation with `--visualise`. A filter pass or high rank does not demonstrate pocket occupancy, experimental binding, or inhibition. See [`docs/visualisation.md`](docs/visualisation.md) for selection options and viewer limitations.
-
-
 ## How it works
 Download the structure of whatever you're targeting from the PDB:
 ```bash
