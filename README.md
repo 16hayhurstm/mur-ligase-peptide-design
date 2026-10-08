@@ -22,18 +22,25 @@ python python/inspect_structure.py <path_to_structure.cif>
 python python/inspect_structure.py data/1P3D.cif
 ```
 
-This prints the canonical and author chain IDs, entity IDs, component codes and descriptions. Use it to find ligand codes such as `UMA` for the pocket mapping step below. Components sharing an entity ID are copies of the same molecular entity. 
+This prints the canonical, author and entity IDs, component codes and descriptions. Use it to identify the target protein and ligand code, such as `UMA`. Components sharing an entity ID are copies of the same molecular entity.
 
-The saved PBD_ID.cif can then be used to identify/estimate the binding pocket(s) residues of specified ligand(s). This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's code (identified by inspect_structure.py output), and a distance cutoff in Angstrom:
+Use the **canonical IDs** to select the protein and ligand copy for pocket mapping. For 1P3D, protein A and UMA E share author ID A. Author IDs help match components. Confirm in a structure viewer when working with unfamiliar structures.
+
+Identify pocket residues by measuring their minimum atom-to-atom distance from the selected ligand. Supply the structure, ligand code, distance cutoff in Å, and canonical protein and ligand IDs:
 
 ```bash
 # Generic usage
-python python/map_pocket.py <path_to_structure.cif> <ligand_code> <distance_cutoff>
+python python/map_pocket.py <path_to_structure.cif> <ligand_code> <distance_cutoff> \
+  --protein-chain <canonical_protein_id> \
+  --ligand-chain <canonical_ligand_id>
 
-# Example used for MurC(1P3D), identifiying the UMA binding site deffined at residues within 5 Angstrom
-python python/map_pocket.py data/1P3D.cif UMA 5.0
+# MurC (1P3D): residues on protein A within 5 Å of UMA E
+python python/map_pocket.py data/1P3D.cif UMA 5.0 \
+  --protein-chain A \
+  --ligand-chain E
 ```
-This prints the pocket residues and a the coordinates of a docking box centred on the ligand. It also tells you which chain it used, and flags modified residues that will cause trouble later.
+
+Both chain flags are required. This prints the pocket residues, estimated docking-box coordinates, selected component identifiers and recognised modified residues requiring attention during receptor preparation. Selecting a ligand here defines the pocket; it does not retain that ligand during design.
 
 Then create the [BoltzGen design specification](https://github.com/HannesStark/boltzgen/tree/main#how-to-make-a-design-specification-yaml) (`.yaml`) using `make_spec.py`.
 

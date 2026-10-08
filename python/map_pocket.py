@@ -1,77 +1,131 @@
-"""Define a binding pocket from a bound ligand.
+"""Map protein residues near explicitly selected ligand components.
 
-Reports the protein residues within a distance cutoff of a named ligand,
-and a docking box that encloses it.
+Usage:
+    python python/map_pocket.py data/1P3D.cif UMA 5.0 --protein-chain A --ligand-chain E
 
-usage:   python map_pocket.py STRUCTURE.cif LIGAND [cutoff]
-example: python map_pocket.py data/1P3D.cif UMA 5.0
-         python map_pocket.py data/4CVM.cif 1452,1453,1454,1455 5.0
+Both selection flags use canonical mmCIF IDs (label_asym_id), as reported
+by inspect_structure.py. Multiple ligand IDs and names are comma-separated.
+LIGAND accepts component names or integer author residue numbers.
 
-The output reports both author and canonical residue identifiers.
-For BoltzGen, use the chain and residue list labelled "BoltzGen residues":
-these use label_asym_id and label_seq_id from the mmCIF file.
-Author identifiers are retained for comparison with the original structure.
-Missing canonical identifiers in selected pocket residues raise an error.        
+Uses the first model and all stored atoms, including hydrogens if present.
+A residue is selected when its minimum atom distance is strictly below the
+cutoff. No symmetry copies are generated. The docking box is an estimate.
 
-LIGAND may be several comma-separated residue names, for structures that
-model a substrate as separate components, e.g. 4CVM stores
-UDP-MurNAc-Ala-Glu as UDP,MUB,ALA,FGA.
-
-
+Use the canonical residue list (label_seq_id) for BoltzGen.
+Ligand selection maps the pocket; it does not retain ligands in a design YAML.
 """
+import argparse
 import sys
 import gemmi
 import numpy as np
 
+# Recognised protein residue names, including two common modifications.
 AA = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO "
          "SER THR TRP TYR VAL MSE KCX".split())
 
 
 def main():
-    if len(sys.argv) < 3:
-        sys.exit(__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("structure_path")
+    parser.add_argument("ligand", help="Component names or author residue numbers")
+    parser.add_argument("cutoff", nargs="?", type=float, default=5.0)
+    parser.add_argument("--protein-chain", required=True,
+                        help="Canonical protein chain ID")
+    parser.add_argument("--ligand-chain", required=True,
+                        help="Comma-separated canonical ligand IDs")
+    args = parser.parse_args()
 
-    path = sys.argv[1]
-    spec = sys.argv[2].split(",")
-    # entries may be residue names (UMA) or residue numbers (1452).
-    # numbers are needed where a substrate component shares a name with a
-    # standard amino acid - 4CVM models an ALA at 1454 as part of its
-    # substrate, and selecting by name would pool every alanine in the chain
-    lig_names = {x for x in spec if not x.isdigit()}
-    lig_nums = {int(x) for x in spec if x.isdigit()}
-    cutoff = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+    path = args.structure_path
+    cutoff = args.cutoff
+    if not np.isfinite(cutoff) or cutoff <= 0:
+        parser.error("The cutoff must be positive and finite.")
 
-    st = gemmi.read_structure(path)
-    st.setup_entities()
+    spec = [value.strip() for value in args.ligand.split(",")]
+    ligand_ids = {value.strip() for value in args.ligand_chain.split(",")}
+    if "" in spec or "" in ligand_ids:
+        parser.error("Selections must not contain empty entries.")
+    if args.protein_chain in ligand_ids:
+        parser.error("Protein and ligand canonical IDs must be different.")
+
+    # Keep support for substrates represented by several separate residues.
+    lig_names = {value for value in spec if not value.isdigit()}
+    lig_nums = {int(value) for value in spec if value.isdigit()}
+
+    try:
+        st = gemmi.read_structure(path)
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+    if len(st) == 0:
+        parser.error("The structure contains no models.")
     model = st[0]
+    if len(st) > 1:
+        print("NOTE: using only the first structural model.")
 
-    prot = max(model, key=lambda c: sum(1 for r in c if r.name in AA))
-    prot_nums = sorted(r.seqid.num for r in prot if r.name in AA)
+    # Select canonical instances, independently of author-chain grouping.
+    # Do not generate missing canonical IDs: they must come from the CIF.
+    protein_residues = []
+    protein_author_ids = set()
+    ligand_residues = []
+    found_ligand_ids = set()
+    matched_names, matched_nums = set(), set()   
 
-    # only the copy in the protein chain being analysed; structures with
-    # several chains hold one ligand each, and pooling them would give a
-    # box spanning the whole crystal
+    for chain in model:
+        for residue in chain:
+            if residue.subchain == args.protein_chain:
+                if residue.label_seq is None:
+                    parser.error("The selected protein contains non-polymer residues.")
+                protein_residues.append(residue)
+                protein_author_ids.add(chain.name)
+
+            if residue.subchain in ligand_ids:
+                matches_name = residue.name in lig_names
+                matches_number = residue.seqid.num in lig_nums
+                if not (matches_name or matches_number):
+                    parser.error(
+                        f"Ligand ID {residue.subchain} contains "
+                        f"{residue.name}{residue.seqid}, which does not match "
+                        f"the requested ligand selection."
+                    )
+                ligand_residues.append((chain.name, residue))
+                found_ligand_ids.add(residue.subchain)
+                if matches_name:
+                    matched_names.add(residue.name)
+                if matches_number:
+                    matched_nums.add(residue.seqid.num)   
+    if not protein_residues or not any(r.name in AA for r in protein_residues):
+        parser.error("The selected canonical ID has no recognised protein residues.")
+    if len(protein_author_ids) != 1:
+        parser.error("The protein selection maps to multiple author chains.")
+    protein_author_id = next(iter(protein_author_ids))
+    missing_ids = ligand_ids - found_ligand_ids
+    if missing_ids:
+        parser.error(f"Ligand IDs not found: {sorted(missing_ids)}")
+    if matched_names != lig_names or matched_nums != lig_nums:
+        parser.error("Not all requested ligand names or numbers were found.")
+
+    prot_nums = sorted(r.seqid.num for r in protein_residues if r.name in AA)
     lig_xyz, lig_res = [], []
-    for ch in model:
-        if ch.name != prot.name:
-            continue
-        for r in ch:
-            if r.name in lig_names or r.seqid.num in lig_nums:
-                lig_xyz += [[a.pos.x, a.pos.y, a.pos.z] for a in r]
-                lig_res.append(f"{r.name}{r.seqid.num}")
+    for author_id, residue in ligand_residues:
+        lig_xyz.extend([[a.pos.x, a.pos.y, a.pos.z] for a in residue])
+        lig_res.append(
+            f"{residue.name} (canonical {residue.subchain}, "
+            f"author {author_id}:{residue.seqid})"
+        )
     if not lig_xyz:
-        sys.exit(f"error: no residue named {sorted(lig_names)} in {path}")
+        parser.error("The selected ligand components contain no atoms.")
     lig = np.array(lig_xyz)
+    if not np.isfinite(lig).all():
+        parser.error("Ligand coordinates contain non-finite values.")
 
     hits = []
 
-    for r in prot:
+    for r in protein_residues:
         if r.name not in AA:
-            continue
-        if r.name in lig_names or r.seqid.num in lig_nums:
             continue
 
         xyz = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in r])
+        if xyz.size == 0 or not np.isfinite(xyz).all():
+            parser.error(f"Missing or invalid coordinates for residue {r.seqid}.")
         d = float(
             np.linalg.norm(xyz[:, None] - lig[None, :], axis=-1).min()
         )
@@ -84,13 +138,13 @@ def main():
             if canonical_residue_index is None or canonical_residue_index < 1:
                 raise ValueError(
                     f"Missing or invalid canonical index for "
-                    f"{prot.name}:{author_residue_id} ({r.name})"
+                    f"{protein_author_id}:{author_residue_id} ({r.name})"
                 )
 
             if not canonical_chain_id:
                 raise ValueError(
                     f"Missing canonical chain ID for "
-                    f"{prot.name}:{author_residue_id} ({r.name})"
+                    f"{protein_author_id}:{author_residue_id} ({r.name})"
                 )
 
             hits.append({
@@ -114,7 +168,7 @@ def main():
 
     print(f"structure : {path}  ({st.resolution} A)")
     print(
-        f"protein   : author chain {prot.name}, {len(prot_nums)} residues "
+        f"protein   : canonical {args.protein_chain}, author {protein_author_id}, {len(prot_nums)} residues "
         f"({prot_nums[0]}-{prot_nums[-1]})"
     )
     print(f"ligand    : {','.join(lig_res)}  ({len(lig)} atoms)")
@@ -123,7 +177,7 @@ def main():
 
     print("  Author chain:residue   Canonical chain:index   Residue   Distance")
     for hit in hits:
-        author_identifier = f"{prot.name}:{hit['author_residue_id']}"
+        author_identifier = f"{protein_author_id}:{hit['author_residue_id']}"
         canonical_identifier = (
             f"{hit['canonical_chain_id']}:{hit['canonical_residue_index']}"
         )
@@ -139,7 +193,7 @@ def main():
         hit["author_residue_id"] for hit in hits
     ]
     print(
-        f"\nauthor residues, chain {prot.name}: "
+        f"\nauthor residues, chain {protein_author_id}: "
         f"{','.join(author_residue_ids)}"
     )
 
@@ -164,19 +218,17 @@ def main():
 
     print(f"\nbox centre: {[round(float(x), 2) for x in centre]}")
     print(
-        f"\nIMPORTANT pass author chain {prot.name} "
+        f"\nIMPORTANT pass author chain {protein_author_id} "
         "to prepare_receptor.py."
     )
-    print("          structures with several chains hold one ligand each,")
-    print("          and the two scripts can otherwise pick different chains,")
-    print("          leaving the docking box outside the receptor.")
+    print("          Keep the same protein copy during receptor preparation.")
     print(
         f"box size  : {extent.max() + 10:.0f} A "
         f"(ligand extent {[round(float(x), 1) for x in extent]})"
     )
 
     modified_residues = [
-        f"{prot.name}:{hit['author_residue_id']} {hit['residue_name']}"
+        f"{protein_author_id}:{hit['author_residue_id']} {hit['residue_name']}"
         for hit in hits
         if hit["residue_name"] in ("MSE", "KCX")
     ]
@@ -190,3 +242,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+     
