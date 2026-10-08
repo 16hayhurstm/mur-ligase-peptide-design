@@ -35,11 +35,24 @@ Download the structure of whatever you're targeting from the PDB:
 # Example used for MurC (1P3D)
 ./scripts/01_fetch_structure.sh 1P3D data
 ```
-The above saves a PBD_ID.cif to the specified output directory which can then be used to identify/estimate the binding pocket(s) residues of specified ligands. This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's name, and a distance cutoff:
+
+Inspect the structure to identify its protein chains, ligands and ions:
 
 ```bash
 # Generic usage
-python python/map_pocket.py <path_to_structure.cif> <ligand_name> <distance_cutoff>
+python python/inspect_structure.py <path_to_structure.cif>
+
+# Example used for MurC (1P3D)
+python python/inspect_structure.py data/1P3D.cif
+```
+
+This prints the canonical and author chain IDs, entity IDs, component codes and descriptions. Use it to find ligand codes such as `UMA` for the pocket mapping step below. Components sharing an entity ID are copies of the same molecular entity. 
+
+The saved PBD_ID.cif can then be used to identify/estimate the binding pocket(s) residues of specified ligand(s). This is done by measuring which residues sit near a bound ligand. Give it the structure, the ligand's code (identified by inspect_structure.py output), and a distance cutoff in Angstrom:
+
+```bash
+# Generic usage
+python python/map_pocket.py <path_to_structure.cif> <ligand_code> <distance_cutoff>
 
 # Example used for MurC(1P3D), identifiying the UMA binding site deffined at residues within 5 Angstrom
 python python/map_pocket.py data/1P3D.cif UMA 5.0
