@@ -46,24 +46,17 @@ Then create the [BoltzGen design specification](https://github.com/HannesStark/b
 
 Use the chain identifier and residue list labelled **"BoltzGen residues, canonical chain ..."** in the output from `map_pocket.py`. These use the canonical mmCIF identifiers (`label_asym_id` and `label_seq_id`), which may differ from the author identifiers. `make_spec.py` writes the supplied identifiers without converting or validating them.
 
-**Current limitation:** the generated specification includes only the selected target chain from the structure. Additional ligands and ions are not explicitly retained. For example, the command below targets the UMA pocket but does not retain bound ANP or manganese ions.
+**Current limitation:** the generated specification includes only the selected target chain from the structure. Additional ions are not explicitly retained. For example, the command below targets the UMA pocket but does not retain manganese ions.
 
 ```bash
 # Generic usage: CHAIN and RESIDUES must use canonical identifiers.
-python python/make_spec.py STRUCTURE.cif CHAIN RESIDUES LENGTH OUT.yaml
+python python/make_spec.py <path_to_structure.cif> <canonical_protein_id> <residue_list> <length_AA> <output_directory>.yaml
 
 # MurC (1P3D): target the UMA pocket with peptides of 8–16 amino acids.
 python python/make_spec.py data/1P3D.cif A \
   25,27,28,29,30,31,32,48,49,50,51,70,84,85,86,87,88,91,107,152,173,174,175,177,178,198,346,348,376,377,380,459 \
   8..16 murc.yaml
 ```
-
-Check the specification before starting a design run:
-
-```bash
-boltzgen check murc.yaml
-```
-
 Inspect the generated check structure to confirm that the intended pocket residues are marked. Successful parsing alone does not confirm that the correct binding site was selected.
 
 Check the design specification is as intended by running:
@@ -85,23 +78,41 @@ bash scripts/03_boltzgen_design.sh <path_to_design_specification> <output_direct
 bash scripts/03_boltzgen_design.sh murc.yaml out_murc 200
 ```
 
+Timing not: roughly an hour for 100 designs on an A6000. Run it under tmux. - Myles' run took 5.5hr for 200, 16.5hrs for 500
 
+Optionally compare the designs before and after refolding in ChimeraX. Use `scripts/04_visualise_designs.sh` to prepare a viewing folder containing up to 20 paired designs:
 
+- Visualisation file still needs sorting
 
-Roughly an hour for 100 designs on an A6000. Run it under tmux. - Myles' run took 5.5hr for 200
+```bash
+bash scripts/04_visualise_designs.sh out_murc visualisations/murc --select all --limit 20
+```
 
-Optionally visualise the results in ChimeraX, using `scripts/04_visualise_designs.sh` to create a viewing folder:
+Use a new destination folder for each set of results.
 
-    bash scripts/04_visualise_designs.sh out_murc visualisations/murc --select all --limit 20
+Download the entire `visualisations/murc` folder to your laptop. In a fresh ChimeraX session, open `compare_refolds.py` using **File > Open**.
 
-This collects up to 20 designs and pairs their structures before and after refolding. Choose a new destination folder for each bundle.
+Use the **Model Panel** to display one design group at a time:
 
-Download the entire `visualisations/murc` folder to your laptop, then open its `compare_refolds.py` file using **File > Open** in a fresh ChimeraX session. Use the **Model Panel** to display one design group at a time: cyan shows the peptide before refolding, magenta shows it after refolding, and grey shows the common MurC reference.
+- **Cyan:** peptide before refolding.
+- **Magenta:** peptide after refolding.
+- **Grey:** common MurC reference, taken from the first selected design before refolding.
+
+The common reference provides a visual comparison; assess clashes using each design’s matching receptor.
 
 See [docs/visualisation.md](docs/visualisation.md) for selection options and further viewing instructions.
 
 
------- Myles Checked up to here
+
+
+
+
+
+
+
+
+
+----------- Myles Checked up to here
 
 
 Now, find out where the designs actually sit. BoltzGen ranks its own output on a refolded complex that doesn't preserve the designed placement, so rank on measured pocket contact instead:
