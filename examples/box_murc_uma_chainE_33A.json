@@ -1,0 +1,141 @@
+{
+  "schema": "mur-ligase-docking-box/1",
+  "written_utc": "2026-11-18T14:51:51Z",
+  "units": "angstrom",
+  "centre_mode": "bounds-midpoint",
+  "centre_angstrom": [
+    25.438499999999998,
+    -6.266500000000001,
+    48.0135
+  ],
+  "size_angstrom": [
+    33.0,
+    33.0,
+    33.0
+  ],
+  "sizing": {
+    "mode": "explicit-size",
+    "requested_angstrom": [
+      33.0,
+      33.0,
+      33.0
+    ],
+    "ligand_extent_angstrom": [
+      13.507000000000001,
+      9.017,
+      14.284999999999997
+    ]
+  },
+  "selection": {
+    "description": "UMA in canonical chain(s) E, author chain(s) A",
+    "ligand_argument": "UMA",
+    "ligand_canonical_chain_ids": [
+      "E"
+    ],
+    "ligand_author_chain_ids": [
+      "A"
+    ],
+    "ligand_residues": [
+      "UMA (canonical E, author A:602)"
+    ],
+    "ligand_author_residue_ids": [
+      "A:602"
+    ],
+    "ligand_atom_count": 49,
+    "protein_canonical_chain_id": "A",
+    "protein_author_chain_id": "A",
+    "pocket_cutoff_angstrom": 5.0,
+    "pocket_residue_count": 32,
+    "pocket_author_residue_ids": [
+      "25",
+      "27",
+      "28",
+      "29",
+      "30",
+      "31",
+      "32",
+      "48",
+      "49",
+      "50",
+      "51",
+      "70",
+      "84",
+      "85",
+      "86",
+      "87",
+      "88",
+      "91",
+      "107",
+      "152",
+      "173",
+      "174",
+      "175",
+      "177",
+      "178",
+      "198",
+      "346",
+      "348",
+      "376",
+      "377",
+      "380",
+      "459"
+    ],
+    "pocket_canonical_residue_indices": [
+      25,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      48,
+      49,
+      50,
+      51,
+      70,
+      84,
+      85,
+      86,
+      87,
+      88,
+      91,
+      107,
+      152,
+      173,
+      174,
+      175,
+      177,
+      178,
+      198,
+      346,
+      348,
+      376,
+      377,
+      380,
+      459
+    ],
+    "pocket_modified_residues": [
+      "A:31 MSE"
+    ]
+  },
+  "source_structure": {
+    "path": "data/1P3D.cif",
+    "sha256": "dba58d35a1eeedf1440abe536c930422cedadd5763d799bfc996761710a05689",
+    "model": 1,
+    "coordinate_frame": "source structure as read (mmCIF Cartn_x/y/z); no transformation, recentring or symmetry operation applied"
+  },
+  "software": {
+    "script": "python/map_pocket.py",
+    "git": {
+      "commit": "47723c0de8809b27888bced7417904d368fac6c6",
+      "working_tree_dirty": true
+    },
+    "gemmi": "0.7.5",
+    "numpy": "2.5.5"
+  },
+  "notes": [
+    "The box is a search region for AutoDock Vina, not a pocket definition, and covering a region is not evidence that the region is the correct one.",
+    "Prepare the receptor from the recorded author protein chain and the recorded source structure; the box carries no transformation.",
+    "Pocket residues are reported for reference and do not enter the box arithmetic."
+  ]
+}

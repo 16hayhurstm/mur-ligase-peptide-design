@@ -119,11 +119,19 @@ Now, find out where the designs actually sit. BoltzGen ranks its own output on a
 
     python python/occupancy.py out_murc/intermediate_designs 25,27,28,29,...
 
-Prepare the receptor. Crystal structures need cleaning before docking — waters and ligands stripped, modified residues repaired, one chain kept:
+Record the search box, rather than retyping its coordinates. `map_pocket.py` writes a box record carrying the centre, three independent dimensions, the selection it came from and the structure and chain it belongs to; `dock.py` reads that record directly:
 
-    python python/prepare_receptor.py data/1P3D.cif murc A 25,27,28,29,...
+    python python/map_pocket.py data/1P3D.cif UMA 5.0 \
+        --protein-chain A --ligand-chain E \
+        --box-size 24 --box-record boxes/murc_uma_chainE_24A.json
 
-Pass the pocket residues and it will warn you if any of them get dropped.
+Prepare the receptor. Crystal structures need cleaning before docking — waters stripped, the chosen components removed, modified residues repaired, one explicitly named protein copy kept:
+
+    python python/prepare_receptor.py data/1P3D.cif receptors/murc_apo \
+        --protein-author-chain A --condition apo \
+        --box-record boxes/murc_uma_chainE_24A.json
+
+The protein copy must be named: 1P3D holds two MurC copies whose pockets are 98.9 Å apart. The box record supplies the pocket residues, so the receptor and the search box cannot come from different selections. Every pocket residue and heavy atom is checked before and after preparation, coordinates are compared atom by atom, and a failure leaves no output labelled usable. A manifest records what was removed, retained, transformed and checked. See [docs/receptor_preparation.md](docs/receptor_preparation.md).
 
 Build the ligands and their controls. Peptides come from sequence via PyMOL, and scrambles give you a composition-matched baseline:
 
@@ -131,22 +139,29 @@ Build the ligands and their controls. Peptides come from sequence via PyMOL, and
 
 Finally, dock across several seeds. One seed isn't a measurement: the search is stochastic enough that the same peptide can move by nearly a kcal/mol between runs:
 
-    python python/dock.py murc.pdbqt pep 25.69,-5.73,48.55 24
+    python python/dock.py receptors/murc_apo_rigid.pdbqt pep dock_run \
+        --box-record boxes/murc_uma_chainE_24A.json \
+        --receptor-manifest receptors/murc_apo.manifest.json
 
-It reports the seed spread next to every mean, and warns when the variation between runs is comparable to the difference between ligands.
+Poses and scores are written for every seed, into an output directory that must sit outside the ligand directory so docked files can't be picked up as inputs next time. It reports the seed spread next to every mean, and warns when the variation between runs is comparable to the difference between ligands. See [docs/docking_box.md](docs/docking_box.md) for the box record, the legacy mode it replaces, and the visual check.
 
 ## Quickstart
 
     ./scripts/01_fetch_structure.sh 1P3D data
-    python python/map_pocket.py data/1P3D.cif UMA 5.0
+    python python/map_pocket.py data/1P3D.cif UMA 5.0 --protein-chain A --ligand-chain E
 
-That prints the pocket residues and a box. Feed the residues to `make_spec.py` to design against them, or go straight to receptor preparation and docking:
+Both chain flags are required. That prints the pocket residues and the legacy box estimate. Feed the residues to `make_spec.py` to design against them, or go straight to receptor preparation and docking:
 
-    python python/prepare_receptor.py data/1P3D.cif murc A "25,27,28,29,30,31,32,48,49,50,51,70,84,85,86,87,88,91,107,152,173,174,175,177,178,198,346,348,376,377,380,459"
+    python python/map_pocket.py data/1P3D.cif UMA 5.0 --protein-chain A --ligand-chain E \
+        --box-size 24 --box-record boxes/murc_uma_chainE_24A.json
+    python python/prepare_receptor.py data/1P3D.cif receptors/murc_apo \
+        --protein-author-chain A --condition apo --box-record boxes/murc_uma_chainE_24A.json
     ./scripts/06_prepare_ligands.sh pep TTDPGFGT $(python python/scramble.py TTDPGFGT 5)
-    python python/dock.py murc.pdbqt pep 25.69,-5.73,48.55 24
+    python python/dock.py receptors/murc_apo_rigid.pdbqt pep dock_run \
+        --box-record boxes/murc_uma_chainE_24A.json \
+        --receptor-manifest receptors/murc_apo.manifest.json
 
-See `docs/environment.md` for the conda environments and system tools required.
+The 24 Å size above is the historical estimate, kept here so the commands run; it is not a validated setting. See `docs/docking_box.md` before choosing one, and `docs/environment.md` for the conda environments and system tools required.
 
 
 ## Sources

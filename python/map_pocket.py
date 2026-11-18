@@ -13,15 +13,67 @@ cutoff. No symmetry copies are generated. The docking box is an estimate.
 
 Use the canonical residue list (label_seq_id) for BoltzGen.
 Ligand selection maps the pocket; it does not retain ligands in a design YAML.
+
+Docking box
+-----------
+Two box reports exist, and they are not the same box.
+
+*Legacy*: the `box centre` and `box size` lines are printed unchanged for
+every run. They use the ligand atom mean as the centre and a single cubic
+`max(extent) + 10` size formatted to the nearest integer. They are kept so
+that previously used boxes remain reconstructable, and they are human-readable
+output only.
+
+*Recorded box*: requested with `--box-record`, together with exactly one of
+`--box-size` (explicit dimensions) or `--box-padding` (clearance per face).
+It centres on the midpoint of the selection's coordinate bounds by default,
+carries three independent dimensions, and is written as a machine-readable
+record that `dock.py` reads directly, so no centre or dimension is retyped.
+Neither sizing mode has a default: the box dimensions are a scientific choice
+and must be stated. `--box-padding` is a guarantee on all six faces, so it is
+accepted only with bounds-midpoint centring; the historical atom-mean centring
+is accepted with `--box-size` only.
+
+Example:
+    python python/map_pocket.py data/1P3D.cif UMA 5.0 \
+        --protein-chain A --ligand-chain E \
+        --box-size 24 --box-record boxes/murc_uma_chainE_24A.json
 """
 import argparse
 import sys
+from pathlib import Path
+
 import gemmi
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import box_geometry
 
 # Recognised protein residue names, including two common modifications.
 AA = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO "
          "SER THR TRP TYR VAL MSE KCX".split())
+
+
+def parse_lengths(parser: argparse.ArgumentParser, text: str | None,
+                  flag: str) -> np.ndarray | None:
+    """Parse one or three comma-separated lengths in A into a (3,) array.
+
+    One value is applied to all three axes; three give independent axes. The
+    values are only checked for syntax and finiteness here; whether they make
+    a usable box is decided by `box_geometry.validated_dimensions`.
+    """
+    if text is None:
+        return None
+    fields = [field.strip() for field in text.split(",")]
+    if len(fields) not in (1, 3):
+        parser.error(f"{flag} takes one value or three comma-separated values.")
+    try:
+        values = [float(field) for field in fields]
+    except ValueError:
+        parser.error(f"{flag} values must be numbers in Angstroms, got {text!r}.")
+    if not all(np.isfinite(value) for value in values):
+        parser.error(f"{flag} values must be finite, got {text!r}.")
+    return np.array(values * 3 if len(values) == 1 else values, dtype=float)
 
 
 def main():
@@ -33,7 +85,33 @@ def main():
                         help="Canonical protein chain ID")
     parser.add_argument("--ligand-chain", required=True,
                         help="Comma-separated canonical ligand IDs")
+    parser.add_argument("--box-record", metavar="PATH",
+                        help="Write a machine-readable box record to PATH")
+    parser.add_argument("--box-centre", default="bounds-midpoint",
+                        choices=list(box_geometry.CENTRE_MODES),
+                        help="Centring mode for the recorded box "
+                             "(default: bounds-midpoint). ligand-atom-mean "
+                             "reconstructs a historical box and is accepted "
+                             "with --box-size only, never with --box-padding")
+    sizing = parser.add_mutually_exclusive_group()
+    sizing.add_argument("--box-size", metavar="S|SX,SY,SZ",
+                        help="Explicit recorded-box dimensions in A")
+    sizing.add_argument("--box-padding", metavar="P|PX,PY,PZ",
+                        help="Clearance per face in A; dimensions become "
+                             "extent + 2 x padding, rounded up to 0.1 A")
+    parser.add_argument("--overwrite-box-record", action="store_true",
+                        help="Replace an existing box record at that path")
     args = parser.parse_args()
+
+    if (args.box_size or args.box_padding) and not args.box_record:
+        parser.error("--box-size and --box-padding require --box-record.")
+    if args.box_record and not (args.box_size or args.box_padding):
+        parser.error(
+            "--box-record requires exactly one of --box-size or --box-padding; "
+            "the box dimensions are a scientific choice and have no default."
+        )
+    box_size = parse_lengths(parser, args.box_size, "--box-size")
+    box_padding = parse_lengths(parser, args.box_padding, "--box-padding")
 
     path = args.structure_path
     cutoff = args.cutoff
@@ -238,6 +316,159 @@ def main():
             f"(author identifiers): {modified_residues}"
         )
         print("     check their handling during receptor preparation - see docs")
+
+    if args.box_record:
+        write_recorded_box(
+            parser=parser,
+            args=args,
+            ligand_xyz=lig,
+            ligand_descriptions=lig_res,
+            ligand_author_ids=sorted({author for author, _ in ligand_residues}),
+            ligand_author_residue_ids=[
+                f"{author}:{residue.seqid.num}{str(residue.seqid.icode).strip()}"
+                for author, residue in ligand_residues
+            ],
+            protein_author_id=protein_author_id,
+            hits=hits,
+            box_size=box_size,
+            box_padding=box_padding,
+        )
+
+
+def write_recorded_box(*, parser, args, ligand_xyz, ligand_descriptions,
+                       ligand_author_ids, ligand_author_residue_ids,
+                       protein_author_id, hits, box_size, box_padding):
+    """Build and write the machine-readable box record, then report it.
+
+    The record is derived from the same ligand atom selection as the legacy
+    lines, but centres on the bounds midpoint by default and carries three
+    independent dimensions. Face clearances against the selection are printed
+    so the clearance actually delivered on each face is visible, rather than
+    being inferred from a nominal padding figure.
+    """
+    try:
+        centre, size, sizing = recorded_box_geometry(
+            ligand_xyz, args.box_centre, box_size, box_padding)
+    except box_geometry.BoxError as error:
+        parser.error(str(error))
+    record = assemble_record(args, centre, size, sizing, ligand_xyz,
+                             ligand_descriptions, ligand_author_ids,
+                             ligand_author_residue_ids, protein_author_id, hits)
+    try:
+        destination = box_geometry.write_record(
+            args.box_record, record, overwrite=args.overwrite_box_record)
+    except box_geometry.BoxError as error:
+        parser.error(str(error))
+
+    low, high = box_geometry.face_clearances(centre, size, ligand_xyz)
+    print(f"\nrecorded box : {destination}")
+    print(f"  centring   : {args.box_centre}")
+    print(f"  centre     : {[round(float(value), 3) for value in centre]} A")
+    print(f"  size x,y,z : {[round(float(value), 2) for value in size]} A")
+    print(f"  ligand clearance, low faces : "
+          f"{[round(float(value), 2) for value in low]} A")
+    print(f"  ligand clearance, high faces: "
+          f"{[round(float(value), 2) for value in high]} A")
+    print(f"  minimum face clearance      : {min(low.min(), high.min()):.2f} A")
+    print("  pass this record to dock.py --box-record; do not retype the numbers.")
+
+
+def recorded_box_geometry(ligand_xyz, centre_mode, box_size, box_padding):
+    """Return the recorded box's centre, dimensions and sizing provenance.
+
+    The centring and sizing combination is validated first: a per-face padding
+    is a guarantee on all six faces, which only bounds-midpoint centring can
+    deliver, so atom-mean centring is accepted with explicit dimensions only.
+    """
+    box_geometry.validated_centre_and_sizing(
+        centre_mode,
+        "explicit-size" if box_size is not None else "padding-per-face")
+    centre = box_geometry.centre_from_points(ligand_xyz, centre_mode)
+    extent = [float(value) for value in box_geometry.extent_from_points(ligand_xyz)]
+    if box_size is not None:
+        size = box_geometry.validated_dimensions(box_size)
+        sizing = {
+            "mode": "explicit-size",
+            "requested_angstrom": [float(value) for value in box_size],
+            "ligand_extent_angstrom": [
+                float(value) for value in box_geometry.extent_from_points(ligand_xyz)
+            ],
+        }
+    else:
+        size = box_geometry.dimensions_from_padding(ligand_xyz, box_padding)
+        sizing = {
+            "mode": "padding-per-face",
+            "padding_per_face_angstrom": [float(value) for value in box_padding],
+            "ligand_extent_angstrom": [
+                float(value) for value in box_geometry.extent_from_points(ligand_xyz)
+            ],
+            "rounding": "dimensions rounded up to 0.1 A so padding is a minimum",
+        }
+    sizing["ligand_extent_angstrom"] = extent
+    return centre, size, sizing
+
+
+def assemble_record(args, centre, size, sizing, ligand_xyz, ligand_descriptions,
+                    ligand_author_ids, ligand_author_residue_ids,
+                    protein_author_id, hits):
+    """Assemble the box record's selection and provenance fields.
+
+    The selection block exists so that a box can be traced to the protein copy
+    it belongs to: canonical and author identifiers for both the ligand and the
+    protein, the components matched, the cutoff and the pocket residue list.
+    """
+    selection = {
+        "description": (
+            f"{','.join(sorted({d.split(' ')[0] for d in ligand_descriptions}))} "
+            f"in canonical chain(s) {args.ligand_chain}, "
+            f"author chain(s) {','.join(ligand_author_ids)}"
+        ),
+        "ligand_argument": args.ligand,
+        "ligand_canonical_chain_ids": sorted(
+            value.strip() for value in args.ligand_chain.split(",")
+        ),
+        "ligand_author_chain_ids": ligand_author_ids,
+        "ligand_residues": ligand_descriptions,
+        "ligand_author_residue_ids": ligand_author_residue_ids,
+        "ligand_atom_count": int(len(ligand_xyz)),
+        "protein_canonical_chain_id": args.protein_chain,
+        "protein_author_chain_id": protein_author_id,
+        "pocket_cutoff_angstrom": float(args.cutoff),
+        "pocket_residue_count": len(hits),
+        "pocket_author_residue_ids": [hit["author_residue_id"] for hit in hits],
+        "pocket_canonical_residue_indices": [
+            hit["canonical_residue_index"] for hit in hits
+        ],
+        "pocket_modified_residues": [
+            f"{protein_author_id}:{hit['author_residue_id']} {hit['residue_name']}"
+            for hit in hits if hit["residue_name"] in ("MSE", "KCX")
+        ],
+    }
+
+    repository_root = Path(__file__).resolve().parents[1]
+    return box_geometry.build_record(
+        centre=centre,
+        size=size,
+        centre_mode=args.box_centre,
+        sizing=sizing,
+        selection=selection,
+        source_structure_path=args.structure_path,
+        software={
+            "script": "python/map_pocket.py",
+            "git": box_geometry.git_commit(repository_root),
+            "gemmi": gemmi.__version__,
+            "numpy": np.__version__,
+        },
+        notes=[
+            "The box is a search region for AutoDock Vina, not a pocket "
+            "definition, and covering a region is not evidence that the "
+            "region is the correct one.",
+            "Prepare the receptor from the recorded author protein chain and "
+            "the recorded source structure; the box carries no transformation.",
+            "Pocket residues are reported for reference and do not enter the "
+            "box arithmetic.",
+        ],
+    )
 
 
 if __name__ == "__main__":
