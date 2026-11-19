@@ -92,8 +92,17 @@ def molfile_lines(component: chemical_component.ChemicalComponent,
         raise LigandError(f"no coordinates for {missing}")
     index = {name: position for position, name in enumerate(names, start=1)}
 
-    lines = [title, "  mur-ligase-peptide-design  CCD connectivity, no hydrogens",
-             ""]
+    # V2000 header. Line 2 is fixed-width and its columns 21-22 carry the
+    # dimensional code: 2 characters of initials, 8 of program name, 10 of
+    # timestamp, then "3D". The previous version put free text there, so
+    # RDKit read no dimensional code, assumed 2D, and warned that it had found
+    # non-zero Z coordinates and was overriding its own assumption. The
+    # timestamp is written as zeros deliberately: the molfile's SHA-256 is
+    # recorded in the manifest, so the file has to be reproducible from the
+    # same inputs.
+    lines = [title,
+             "  " + "murligpd" + "0" * 10 + "3D",
+             "CCD connectivity and modelled formal charges; no hydrogens"]
     bonds = sorted(
         (tuple(sorted((component.graph.names[a], component.graph.names[b]))), order)
         for pair, order in component.graph.bonds.items()

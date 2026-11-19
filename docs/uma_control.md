@@ -396,27 +396,82 @@ Comparing the two plans' `modelled` states is what shows `PB` moving between
    dictionary's against the manifest, and the plan's recorded manifest hash
    against the manifest being used. A revised CCD entry or an edited molfile
    stops the run.
-2. **Formal charge** must equal the manifest's modelled charge. **A charge of
+2. **The molfile's own bond orders**, read from its bond block with no
+   toolkit and no aromaticity model, against the dictionary's `value_order`
+   bond for bond. This asks only "is the file we wrote the file we meant",
+   and a disagreement here means it is not.
+3. **Formal charge** must equal the manifest's modelled charge. **A charge of
    0 where −3 was intended means the `M  CHG` block was not applied and the
-   molecule is the neutral form** — the single most likely silent failure in
-   this stage.
-3. **Heavy-atom count** against the reference, and the molfile must carry no
+   molecule is the neutral form** — the most likely silent failure here.
+4. **Heavy-atom count** against the reference, and the molfile must carry no
    hydrogens yet.
-4. **Index-to-name correspondence, derived from the coordinates**, then
+5. **Index-to-name correspondence, derived from the coordinates**, then
    validated against elements and connectivity, and required to be a
    bijection. The molfile has no atom names, so the mapping is matched by
-   position against the reference and *then* checked; it is never assumed from
-   file order, and the plan's stereocentre list is never used as an ordering.
-   The record states whether the derived mapping happened to equal file order.
-5. **Connectivity** against the dictionary through that mapping, with missing
-   bonds, unexpected bonds and bond-order differences reported separately.
-6. **Stereochemistry from 3D** — `AssignStereochemistryFrom3D` followed by
-   `rdCIPLabeler.AssignCIPLabels`, the accurate labeller, since the comparison
-   is against the dictionary's CIP configurations. Each centre is compared
-   per the state's plan.
-7. **Hydrogen addition** with `AddHs(addCoords=True)`: no embedding, no
+   position against the reference and *then* checked; it is never assumed
+   from file order, and the plan's stereocentre list is never used as an
+   ordering.
+6. **Connectivity after identical sanitisation.** The expected molecule is
+   built from the same connection table and the same modelled formal charges,
+   given the same coordinates, and sanitised the same way, so both sides
+   carry whatever aromaticity RDKit assigns. See below.
+7. **Stereochemistry from 3D** — `AssignStereochemistryFrom3D` followed by
+   `rdCIPLabeler.AssignCIPLabels`, the accurate labeller, since the
+   comparison is against the dictionary's CIP configurations.
+8. **Hydrogen addition** with `AddHs(addCoords=True)`: no embedding, no
    conformer generation, no minimisation. Charge, stereochemistry and every
    heavy-atom coordinate are then rechecked, and any change fails the run.
+
+#### Kekulé input against an aromatising toolkit
+
+The first real run failed here. What has been established is narrow and
+worth stating precisely: **the raw molfile bond table matches the CCD**. That
+is a statement about the connection table only. Stereochemistry and hydrogen
+addition were never reached by that run and remain unverified.
+
+```
+order differences:
+  C2-N1: dictionary SING, molecule AROMATIC
+  C2-N3: dictionary SING, molecule AROMATIC
+  C4-C5: dictionary SING, molecule AROMATIC
+  C4-N3: dictionary SING, molecule AROMATIC
+  C5-C6: dictionary DOUB, molecule AROMATIC
+```
+
+UMA's uracil ring is declared in the dictionary in **Kekulé** form — the
+entry flags no aromatic atoms at all, and gives `C5=C6` double with the rest
+of the ring single. The molfile's bond table reproduces that exactly: checked
+bond for bond, all 51 bonds agree in both membership and order, which is now
+step 2 above. RDKit then **sanitises** the molecule on reading, its
+aromaticity model perceives the ring, and the ring bonds come back as
+`AROMATIC`. Comparing a perceived molecule against an unperceived connection
+table reports differences that are purely representational.
+
+What this does **not** establish: that the stereochemistry is right, that
+hydrogen addition behaves, or that the ligand is fit to dock. The first run
+stopped at step 2's successor and never reached steps 7 or 8. Those checks
+exist, have never been executed against this ligand, and are the point of
+rerunning.
+
+The fix is to compare like with like. The expected molecule is now
+constructed through RDKit from the dictionary's connectivity and the modelled
+charges, given the same coordinates, and sanitised identically, so both sides
+share one aromaticity model. A genuine bond-order difference still shows,
+because it would survive identical perception — a regression test and a
+negative test cover both halves.
+
+Two things deliberately **not** done, because either would have made the
+symptom disappear while removing the check: aromatic differences are not
+ignored, and sanitisation is not relaxed or disabled. The raw Kekulé
+comparison against the dictionary also still runs, on the file itself, where
+no perception is involved.
+
+One observation left open: the first run flagged **five** of the six ring
+bonds, with `C6-N1` agreeing. A ring is aromatised as a whole, so five of six
+is peculiar and is worth understanding rather than normalising away. It does
+not affect the fix — identical perception on both sides handles it either
+way — but the Epicac check below prints RDKit's perceived orders for the ring
+so the asymmetry can be looked at directly.
 
 #### A changed R/S label is not assumed to be an inversion
 
@@ -456,6 +511,53 @@ than accepting any JSON file at that path.
 
 The record carries the RDKit version, every input hash, the output hash, the
 derived correspondence, all three check groups and the hydrogen count.
+
+#### Do the existing inputs need rebuilding?
+
+**No.** The molfiles already on Epicac are correct: their bond blocks are the
+dictionary's Kekulé form bond for bond, and the fix is entirely in the
+comparison. Rerun the verification against the **existing**
+`ligands/uma_ligand.mol`, `ligands/uma.ligand.json` and
+`ligands/uma.stereo_plan.json`. Preserve the failed verification records; they
+are the evidence of what the first run found.
+
+One cosmetic defect was fixed in the generator: line 2 of the molfile had free
+text where V2000 keeps the dimensional code in columns 21-22, so RDKit warned
+`molecule is tagged as 2D, but at least one Z coordinate is not zero`. It
+corrected itself and read the coordinates properly, so this changed no result.
+Molfiles written from now on carry `3D` there, with a zeroed timestamp so the
+file stays reproducible from the same inputs. Rebuilding an existing ligand
+only to pick that up would change its hash and so require regenerating its
+stereo plan as well, for no gain — do it only when a ligand is being rebuilt
+anyway.
+
+#### If the ring asymmetry needs looking at
+
+Read-only, and prints what RDKit actually perceives:
+
+```bash
+python - <<'PY_INNER'
+import sys; sys.path.insert(0, "python")
+from rdkit import Chem
+mol = Chem.MolFromMolFile("ligands/uma_ligand.mol", removeHs=False,
+                          sanitize=True)
+ring = {"N1", "C2", "N3", "C4", "C5", "C6"}
+names = [line.split()[1] for line in open("ligands/uma_ligand.mol")
+         if False]            # molfile carries no names; use the CCD order
+import chemical_component
+component = chemical_component.read_component("components/UMA.cif")
+order = list(component.heavy_atom_names)
+for bond in mol.GetBonds():
+    first = order[bond.GetBeginAtomIdx()]
+    second = order[bond.GetEndAtomIdx()]
+    if first in ring and second in ring:
+        print(f"{first:>3}-{second:<3} perceived {bond.GetBondType()!s:<9} "
+              f"aromatic={bond.GetIsAromatic()} "
+              f"ringAtomsAromatic="
+              f"{mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetIsAromatic()}"
+              f"/{mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetIsAromatic()}")
+PY_INNER
+```
 
 ### Stage 5 — Meeko preparation (Meeko)
 
@@ -646,21 +748,41 @@ Interpretation limits, which the analysis record also carries:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-228 tests. What they do and do not establish, kept apart deliberately:
+242 tests, 4 of which require RDKit and skip without it. What they do and
+do not establish, kept apart deliberately:
 
 | Suite | Needs | Covers |
 | --- | --- | --- |
 | `tests/test_uma_control.py` | nothing / Gemmi | the molecular graph, resonance normalisation restricted to deprotonated groups, automorphism enumeration, in-place RMSD, pose-file parsing, the recovery logic, dictionary reading, reference extraction, both ligand stages and the stereo plan |
-| `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the four input-identity guards run end to end against the real files |
+| `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, the raw molfile bond-order reader, bond-order vocabulary normalisation, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the five input-identity guards run end to end |
+| `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule. **Skipped without RDKit, so never executed on the Mac** |
+| `tests/test_ligand_verification.py::RdkitAbsenceTests` | RDKit **absent** | the diagnostic given when RDKit is missing. Skips wherever RDKit is installed |
 
-**The RDKit integration is not exercised by any test.** `MolFromMolFile`,
-`AssignStereochemistryFrom3D`, `rdCIPLabeler.AssignCIPLabels`,
-`AddHs(addCoords=True)` and `MolToMolFile` are reached only through the thin
-adapter in `verify_ligand_rdkit.py`, which is never executed in the suite:
-RDKit is not installed on the development machine. There is deliberately **no
-RDKit stub** — stubbing stereochemistry perception would assert chemistry that
-nothing in the suite can check, and could hide an interface error instead of
-revealing one.
+**Expected skips depend on the machine, and one skip is always expected.**
+`RdkitRepresentationTests` needs RDKit; `RdkitAbsenceTests` needs its
+absence. Exactly one of the two groups runs anywhere:
+
+| Machine | Ran | Skipped | Which |
+| --- | --- | --- | --- |
+| Mac (no RDKit) | 242 | 4 | the four `RdkitRepresentationTests` |
+| Epicac (`boltz`, RDKit present) | 242 | **1** | `RdkitAbsenceTests` only |
+
+An Epicac run reporting more than one skip means something else is being
+skipped and is worth reading: before this revision, five `InputGuardTests`
+skipped there because their fixtures lived under a git-excluded, Mac-only
+path, which is now fixed by generating the fixtures in the test.
+
+**The RDKit integration is only exercised where RDKit is installed.**
+`MolFromMolFile`, `AssignStereochemistryFrom3D`,
+`rdCIPLabeler.AssignCIPLabels`, `AddHs(addCoords=True)` and `MolToMolFile`
+are reached only through the thin adapter in `verify_ligand_rdkit.py`. The
+four `RdkitRepresentationTests` do exercise the expected-molecule
+construction and the representation comparison, but **they skip on the
+development machine and were written without ever being run**, so on Epicac
+they are themselves a first execution rather than a passing guarantee. There
+is deliberately **no RDKit stub** — stubbing stereochemistry perception would
+assert chemistry that nothing in the suite can check, and could hide an
+interface error instead of revealing one.
 
 What *is* exercised locally on that path: the module imports, the argument
 handling, all four input-identity guards, and the failure route end to end.

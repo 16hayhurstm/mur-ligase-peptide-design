@@ -74,6 +74,24 @@ COORDINATE_TOLERANCE_ANGSTROM = 0.002
 BOND_TYPE_TO_CCD = {"SINGLE": "SING", "DOUBLE": "DOUB", "TRIPLE": "TRIP",
                     "AROMATIC": "AROM"}
 
+# V2000 bond-order codes, for reading a molfile's own bond block.
+MOLFILE_CODE_TO_CCD = {1: "SING", 2: "DOUB", 3: "TRIP", 4: "AROM"}
+
+# CCD value_order strings mapped to RDKit bond types, for building the
+# expected molecule.
+CCD_TO_RDKIT_BOND = {"SING": "SINGLE", "DOUB": "DOUBLE", "TRIP": "TRIPLE",
+                     "AROM": "AROMATIC"}
+
+
+def normalise_order(order: str) -> str:
+    """Map a bond order from either vocabulary onto one canonical token.
+
+    The CCD writes `SING`/`DOUB`; RDKit reports `SINGLE`/`DOUBLE`/`AROMATIC`.
+    Comparisons normalise both sides so that a vocabulary difference is never
+    mistaken for a chemical one, and a chemical one is never hidden.
+    """
+    return BOND_TYPE_TO_CCD.get(order.upper(), order.upper())
+
 
 class VerificationError(RuntimeError):
     """Raised when a ligand cannot be verified. Never produces a pass."""
@@ -201,10 +219,10 @@ def validate_connectivity(mapping: dict[int, str], snapshot: MoleculeSnapshot,
     missing = sorted("-".join(sorted(pair)) for pair in set(expected) - set(found))
     extra = sorted("-".join(sorted(pair)) for pair in set(found) - set(expected))
     order_differences = sorted(
-        f"{'-'.join(sorted(pair))}: dictionary {expected[pair]}, "
+        f"{'-'.join(sorted(pair))}: expected {expected[pair]}, "
         f"molecule {found[pair]}"
         for pair in set(expected) & set(found)
-        if BOND_TYPE_TO_CCD.get(found[pair], found[pair]) != expected[pair]
+        if normalise_order(found[pair]) != normalise_order(expected[pair])
     )
     return {
         "n_dictionary_bonds": len(expected),
@@ -213,6 +231,83 @@ def validate_connectivity(mapping: dict[int, str], snapshot: MoleculeSnapshot,
         "unexpected_bonds": extra,
         "bond_order_differences": order_differences,
         "agrees": not (missing or extra or order_differences),
+    }
+
+
+def molfile_bond_orders(path: Path, names: Sequence[str]
+                        ) -> dict[frozenset[str], str]:
+    """Read a V2000 molfile's own bond block, before any perception.
+
+    Returns bond orders keyed by the pair of atom names, taking the atom order
+    from `names`. The counts line gives the atom and bond counts in columns
+    1-3 and 4-6; each bond line gives the two 1-based atom indices and the
+    order code in columns 1-3, 4-6 and 7-9.
+
+    This reads what the file says, with no toolkit and no aromaticity model
+    involved, which is what makes it the right check for "is the file we wrote
+    the file we meant". Perception is a separate question and is compared
+    separately.
+    """
+    lines = Path(path).read_text().splitlines()
+    if len(lines) < 4:
+        raise VerificationError(f"{path} is too short to be a molfile")
+    try:
+        n_atoms = int(lines[3][0:3])
+        n_bonds = int(lines[3][3:6])
+    except ValueError as error:
+        raise VerificationError(
+            f"{path} line 4 is not a V2000 counts line: {error}") from error
+    if n_atoms != len(names):
+        raise VerificationError(
+            f"{path} declares {n_atoms} atoms but the connection table names "
+            f"{len(names)}")
+    orders: dict[frozenset[str], str] = {}
+    for offset in range(n_bonds):
+        line = lines[4 + n_atoms + offset]
+        try:
+            first, second, code = (int(line[0:3]), int(line[3:6]),
+                                   int(line[6:9]))
+        except (ValueError, IndexError) as error:
+            raise VerificationError(
+                f"{path} bond line {offset + 1} is malformed: {error}") from error
+        if code not in MOLFILE_CODE_TO_CCD:
+            raise VerificationError(
+                f"{path} bond line {offset + 1} has order code {code}, which "
+                f"this reader does not interpret")
+        orders[frozenset((names[first - 1], names[second - 1]))] = \
+            MOLFILE_CODE_TO_CCD[code]
+    return orders
+
+
+def validate_raw_molfile_bonds(path: Path, names: Sequence[str],
+                               dictionary_bonds: Iterable[tuple[str, str, str]]
+                               ) -> dict[str, object]:
+    """Compare the molfile's written bond orders with the dictionary's, exactly.
+
+    No perception on either side: the file's Kekule assignment must be the
+    dictionary's Kekule assignment, bond for bond. A disagreement here means
+    the file we wrote is not the molecule we meant, which no later check could
+    excuse.
+    """
+    expected = {frozenset((first, second)): order
+                for first, second, order in dictionary_bonds}
+    written = molfile_bond_orders(path, names)
+    missing = sorted("-".join(sorted(pair)) for pair in set(expected) - set(written))
+    extra = sorted("-".join(sorted(pair)) for pair in set(written) - set(expected))
+    differences = sorted(
+        f"{'-'.join(sorted(pair))}: dictionary {expected[pair]}, "
+        f"molfile {written[pair]}"
+        for pair in set(expected) & set(written)
+        if expected[pair] != written[pair])
+    return {
+        "n_dictionary_bonds": len(expected),
+        "n_molfile_bonds": len(written),
+        "missing_bonds": missing,
+        "unexpected_bonds": extra,
+        "order_differences": differences,
+        "agrees": not (missing or extra or differences),
+        "basis": ("the molfile's own bond block against the dictionary's "
+                  "value_order, with no aromaticity perception on either side"),
     }
 
 
@@ -405,6 +500,65 @@ def read_and_assign(path: Path) -> tuple[object, MoleculeSnapshot]:
     return mol, snapshot_from_rdkit(mol)
 
 
+def expected_molecule_from_dictionary(component, charges: dict[str, int],
+                                      positions: dict[str, tuple[float, float, float]]):
+    """Build the molecule the dictionary and the modelled charges describe.
+
+    Why this exists: the dictionary records a Kekule connection table, while
+    RDKit applies its own aromaticity model when it sanitises a molecule. The
+    uracil ring of UMA is written with alternating single and double bonds and
+    comes back from RDKit with aromatic bonds, so comparing RDKit's perception
+    against the raw dictionary reports five differences that are purely
+    representational.
+
+    The fix is to compare like with like: this constructs the expected
+    molecule from the dictionary's connectivity and the *modelled* formal
+    charges, gives it the same coordinates, and sanitises it the same way, so
+    both sides carry whatever aromaticity RDKit assigns. A genuine bond-order
+    difference still shows, because it would survive identical perception.
+
+    Nothing is relaxed or disabled: sanitisation runs in full on both sides,
+    and the raw Kekule comparison against the dictionary runs separately on
+    the file itself.
+    """
+    from rdkit import Chem
+    from rdkit.Geometry import Point3D
+
+    builder = Chem.RWMol()
+    index: dict[str, int] = {}
+    for name in component.heavy_atom_names:
+        atom = Chem.Atom(component.elements[name].capitalize())
+        atom.SetFormalCharge(int(charges.get(name, 0)))
+        index[name] = builder.AddAtom(atom)
+    for pair, order in component.graph.bonds.items():
+        first, second = tuple(pair)
+        first_name = component.graph.names[first]
+        second_name = component.graph.names[second]
+        rdkit_order = CCD_TO_RDKIT_BOND.get(order)
+        if rdkit_order is None:
+            raise VerificationError(
+                f"dictionary bond order {order!r} between {first_name} and "
+                f"{second_name} has no RDKit equivalent")
+        builder.AddBond(index[first_name], index[second_name],
+                        getattr(Chem.BondType, rdkit_order))
+    molecule = builder.GetMol()
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    for name, position in index.items():
+        x, y, z = positions[name]
+        conformer.SetAtomPosition(position, Point3D(x, y, z))
+    molecule.AddConformer(conformer)
+    try:
+        Chem.SanitizeMol(molecule)
+    except Exception as error:                                  # noqa: BLE001
+        raise VerificationError(
+            f"the molecule described by the dictionary and the modelled "
+            f"charges does not sanitise: {error}. That is a problem with the "
+            f"connection table or the chosen protonation, not with the "
+            f"prepared ligand."
+        ) from error
+    return molecule, snapshot_from_rdkit(molecule), index
+
+
 def add_hydrogens(mol):
     """Add hydrogens with coordinates, without embedding or minimising.
 
@@ -551,6 +705,24 @@ def verify(args: argparse.Namespace, hydrogenated_path: Path) -> dict[str, objec
     reference_elements = {name: entry["element"]
                           for name, entry in reference_record["atom_mapping"].items()}
 
+    # The molfile's own bond orders, checked before any perception and
+    # without a toolkit. If the file does not say what the dictionary says,
+    # nothing downstream can make it right.
+    dictionary_bonds = [
+        (component.graph.names[first], component.graph.names[second], order)
+        for pair, order in component.graph.bonds.items()
+        for first, second in (tuple(pair),)
+    ]
+    raw_bonds = validate_raw_molfile_bonds(
+        molfile, component.heavy_atom_names, dictionary_bonds)
+    if not raw_bonds["agrees"]:
+        raise VerificationError(
+            f"the molfile's own bond orders disagree with "
+            f"{component.identifier}: missing {raw_bonds['missing_bonds'][:5]}, "
+            f"unexpected {raw_bonds['unexpected_bonds'][:5]}, order "
+            f"differences {raw_bonds['order_differences'][:5]}. The file does "
+            f"not describe the intended molecule; rebuild it.")
+
     # Every input is now established; from here a toolkit is required.
     version = rdkit_version()
     mol, snapshot = read_and_assign(molfile)
@@ -579,18 +751,38 @@ def verify(args: argparse.Namespace, hydrogenated_path: Path) -> dict[str, objec
             "elements disagree under the derived correspondence: "
             + "; ".join(element_problems[:5]))
 
-    dictionary_bonds = [
-        (component.graph.names[first], component.graph.names[second], order)
-        for pair, order in component.graph.bonds.items()
-        for first, second in (tuple(pair),)
+    # Perceived comparison: the expected molecule is built from the same
+    # connectivity and the same modelled charges, given the same coordinates,
+    # and sanitised the same way, so both sides carry RDKit's aromaticity.
+    charges = {atom: -1 for atom
+               in manifest["protonation_state"]["deprotonated_atoms"]}
+    expected_mol, expected_snapshot, expected_index = \
+        expected_molecule_from_dictionary(component, charges, reference_atoms)
+    expected_names = {position: name for name, position in expected_index.items()}
+    perceived_bonds = [
+        (expected_names[first], expected_names[second], order)
+        for first, second, order in expected_snapshot.bonds
+        if first in expected_names and second in expected_names
     ]
-    connectivity = validate_connectivity(mapping, snapshot, dictionary_bonds)
+    connectivity = validate_connectivity(mapping, snapshot, perceived_bonds)
+    connectivity["basis"] = (
+        "both sides built from the same connection table and modelled "
+        "charges and sanitised identically, so aromaticity perception is "
+        "common to both and only a chemical difference shows")
     if not connectivity["agrees"]:
         raise VerificationError(
-            f"connectivity disagrees with {component.identifier}: missing "
+            f"connectivity disagrees with {component.identifier} after "
+            f"identical sanitisation: missing "
             f"{connectivity['missing_bonds'][:5]}, unexpected "
             f"{connectivity['unexpected_bonds'][:5]}, order differences "
-            f"{connectivity['bond_order_differences'][:5]}")
+            f"{connectivity['bond_order_differences'][:5]}. Both sides were "
+            f"perceived the same way, so this is a chemical difference, not a "
+            f"representation difference.")
+    if expected_snapshot.formal_charge != expected_charge:
+        raise VerificationError(
+            f"the dictionary plus the modelled deprotonations gives a formal "
+            f"charge of {expected_snapshot.formal_charge}, but the manifest "
+            f"records {expected_charge}")
 
     assigned = {mapping[index]: code for index, code in snapshot.cip_codes
                 if index in mapping}
@@ -675,7 +867,8 @@ def verify(args: argparse.Namespace, hydrogenated_path: Path) -> dict[str, objec
                 "bijective": True,
             },
             "elements": {"disagreements": element_problems, "agrees": True},
-            "connectivity": connectivity,
+            "molfile_bond_orders_before_perception": raw_bonds,
+            "connectivity_after_identical_sanitisation": connectivity,
             "stereochemistry_before_hydrogens": stereo,
             "stereochemistry_after_hydrogens": stereo_after,
             "stereochemistry_unchanged_by_hydrogen_addition": True,
@@ -717,8 +910,14 @@ def report(record: dict[str, object], record_path: Path,
     correspondence = checks["index_to_name_correspondence"]
     print(f"correspondence   : bijective, derived from coordinates; "
           f"equals file order: {correspondence['equals_file_order']}")
-    print(f"connectivity     : {checks['connectivity']['n_molecule_heavy_bonds']}"
-          f"/{checks['connectivity']['n_dictionary_bonds']} bonds agree")
+    raw = checks["molfile_bond_orders_before_perception"]
+    perceived = checks["connectivity_after_identical_sanitisation"]
+    print(f"molfile bonds    : {raw['n_molfile_bonds']}"
+          f"/{raw['n_dictionary_bonds']} agree with the dictionary's Kekule "
+          f"orders, before perception")
+    print(f"connectivity     : {perceived['n_molecule_heavy_bonds']}"
+          f"/{perceived['n_dictionary_bonds']} bonds agree after identical "
+          f"sanitisation of both sides")
     stereo = checks["stereochemistry_before_hydrogens"]
     print(f"\nstereochemistry, centres expected to match "
           f"({len(stereo['centres_expected_to_match'])}):")
