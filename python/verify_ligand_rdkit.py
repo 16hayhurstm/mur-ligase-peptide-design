@@ -500,6 +500,45 @@ def read_and_assign(path: Path) -> tuple[object, MoleculeSnapshot]:
     return mol, snapshot_from_rdkit(mol)
 
 
+def charge_consistency_problems(component, charges: dict[str, int]) -> list[str]:
+    """Report negative charges that the connection table cannot support.
+
+    A negative charge is only meaningful on an atom that had an acidic proton
+    to lose. This is the same rule `chemical_component.validated_protonation`
+    applies when a state is chosen; it is repeated here because the expected
+    molecule can be built directly, and checking it first turns an opaque
+    valence error from the sanitiser ("Explicit valence for atom # 6 O, 2, is
+    greater than permitted") into a message naming the atom and its bonds.
+
+    This is **not** a valence model and does not replace sanitisation: the
+    sanitiser still runs in full afterwards and remains the authority. It runs
+    before RDKit is imported so that the check is available, and testable,
+    without a toolkit.
+    """
+    problems: list[str] = []
+    for name, charge in sorted(charges.items()):
+        if charge >= 0:
+            continue
+        if name not in component.elements:
+            problems.append(f"{name} is not in {component.identifier}")
+            continue
+        if name in component.hydrogens_on:
+            continue
+        neighbours = ", ".join(
+            f"{component.graph.names[neighbour]} ({order})"
+            for neighbour, order
+            in component.graph.adjacency[component.graph.index[name]])
+        problems.append(
+            f"{name} ({component.elements[name]}, bonded to {neighbours}) is "
+            f"assigned a charge of {charge} but bears no hydrogen in the "
+            f"neutral form, so it has no acidic proton to lose. Charging a "
+            f"doubly bonded carbonyl or phosphoryl oxygen while leaving its "
+            f"bond order unchanged is an invalid charge and bond-order "
+            f"assignment for this model: the valence and the charge cannot "
+            f"both be satisfied as written")
+    return problems
+
+
 def expected_molecule_from_dictionary(component, charges: dict[str, int],
                                       positions: dict[str, tuple[float, float, float]]):
     """Build the molecule the dictionary and the modelled charges describe.
@@ -521,6 +560,12 @@ def expected_molecule_from_dictionary(component, charges: dict[str, int],
     and the raw Kekule comparison against the dictionary runs separately on
     the file itself.
     """
+    problems = charge_consistency_problems(component, charges)
+    if problems:
+        raise VerificationError(
+            "the requested charges cannot be reconciled with the connection "
+            "table: " + "; ".join(problems))
+
     from rdkit import Chem
     from rdkit.Geometry import Point3D
 
@@ -550,11 +595,24 @@ def expected_molecule_from_dictionary(component, charges: dict[str, int],
     try:
         Chem.SanitizeMol(molecule)
     except Exception as error:                                  # noqa: BLE001
+        # RDKit identifies the offending atom by index, which is opaque on its
+        # own, so the charged atoms and their bond environments are named here.
+        charged = ", ".join(
+            f"{name}={charge} (bonded to "
+            + ", ".join(f"{component.graph.names[neighbour]} {order}"
+                        for neighbour, order
+                        in component.graph.adjacency[component.graph.index[name]])
+            + ")"
+            for name, charge in sorted(charges.items()) if charge) or "none"
+        order = ", ".join(f"#{position} {name}" for position, name
+                          in enumerate(component.heavy_atom_names))
         raise VerificationError(
             f"the molecule described by the dictionary and the modelled "
             f"charges does not sanitise: {error}. That is a problem with the "
             f"connection table or the chosen protonation, not with the "
-            f"prepared ligand."
+            f"prepared ligand.\n"
+            f"       charged atoms: {charged}\n"
+            f"       atom order (RDKit index to name): {order}"
         ) from error
     return molecule, snapshot_from_rdkit(molecule), index
 

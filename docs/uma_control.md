@@ -748,14 +748,15 @@ Interpretation limits, which the analysis record also carries:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-242 tests, 4 of which require RDKit and skip without it. What they do and
+252 tests, 5 of which require RDKit and skip without it. What they do and
 do not establish, kept apart deliberately:
 
 | Suite | Needs | Covers |
 | --- | --- | --- |
 | `tests/test_uma_control.py` | nothing / Gemmi | the molecular graph, resonance normalisation restricted to deprotonated groups, automorphism enumeration, in-place RMSD, pose-file parsing, the recovery logic, dictionary reading, reference extraction, both ligand stages and the stereo plan |
 | `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, the raw molfile bond-order reader, bond-order vocabulary normalisation, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the five input-identity guards run end to end |
-| `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule. **Skipped without RDKit, so never executed on the Mac** |
+| `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule in both the charged and the neutral form. **Skipped without RDKit, so never executed on the Mac** |
+| `tests/test_ligand_verification.py::ChargeConsistencyTests` | nothing / Gemmi | that a negative charge is only accepted on an atom bearing an acidic proton, reported with the atom's name and bonds rather than RDKit's atom index |
 | `tests/test_ligand_verification.py::RdkitAbsenceTests` | RDKit **absent** | the diagnostic given when RDKit is missing. Skips wherever RDKit is installed |
 
 **Expected skips depend on the machine, and one skip is always expected.**
@@ -764,8 +765,8 @@ absence. Exactly one of the two groups runs anywhere:
 
 | Machine | Ran | Skipped | Which |
 | --- | --- | --- | --- |
-| Mac (no RDKit) | 242 | 4 | the four `RdkitRepresentationTests` |
-| Epicac (`boltz`, RDKit present) | 242 | **1** | `RdkitAbsenceTests` only |
+| Mac (no RDKit) | 252 | 5 | the five `RdkitRepresentationTests` |
+| Epicac (`boltz`, RDKit present) | 252 | **1** | `RdkitAbsenceTests` only |
 
 An Epicac run reporting more than one skip means something else is being
 skipped and is worth reading: before this revision, five `InputGuardTests`

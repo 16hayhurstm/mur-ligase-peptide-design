@@ -360,6 +360,110 @@ class OrderNormalisationTests(unittest.TestCase):
         self.assertEqual(len(report["bond_order_differences"]), 1)
 
 
+class ChargeConsistencyTests(unittest.TestCase):
+    """The charge/connectivity check, which runs before RDKit is imported.
+
+    Needs no toolkit, so this runs everywhere. It exists because RDKit
+    reports a valence failure by atom index — "Explicit valence for atom # 6
+    O, 2, is greater than permitted" — which says nothing about which atom
+    that is or why.
+    """
+
+    @staticmethod
+    def component(hydrogens_on):
+        import chemical_component
+        import chemical_graph
+        names = ["C1", "C2", "O1", "O2"]
+        elements = {"C1": "C", "C2": "C", "O1": "O", "O2": "O"}
+        graph = chemical_graph.graph_from_bond_names(
+            names, [elements[name] for name in names],
+            [("C1", "C2", "SING"), ("C2", "O1", "DOUB"), ("C2", "O2", "SING")])
+        return chemical_component.ChemicalComponent(
+            identifier="ACT", name="acetic acid", formula="C2 H4 O2",
+            dictionary_formal_charge=0, graph=graph, elements=elements,
+            hydrogens_on=hydrogens_on, stereocentres={}, aromatic_atoms=(),
+            n_hydrogens=4, source_path="in-memory fixture")
+
+    def setUp(self):
+        try:
+            import chemical_component  # noqa: F401
+        except ImportError:
+            self.skipTest("needs Gemmi for the component dataclass")
+        self.acid = self.component({"O2": ("HO2",)})
+
+    def test_charging_an_acidic_hydroxyl_is_accepted(self):
+        self.assertEqual(
+            verify.charge_consistency_problems(self.acid, {"O2": -1}), [])
+
+    def test_no_charges_is_accepted(self):
+        self.assertEqual(verify.charge_consistency_problems(self.acid, {}), [])
+
+    def test_zero_charges_are_ignored(self):
+        self.assertEqual(
+            verify.charge_consistency_problems(self.acid, {"O1": 0}), [])
+
+    def test_charging_a_carbonyl_oxygen_is_reported_with_its_bonds(self):
+        """The cause of the first Epicac error, named rather than indexed."""
+        problems = verify.charge_consistency_problems(self.acid, {"O1": -1})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("O1", problems[0])
+        self.assertIn("C2 (DOUB)", problems[0])
+        self.assertIn("no hydrogen in the neutral form", problems[0])
+        self.assertIn("no acidic proton", problems[0])
+
+    def test_charging_an_unknown_atom_is_reported(self):
+        problems = verify.charge_consistency_problems(self.acid, {"O99": -1})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not in ACT", problems[0])
+
+    def test_several_problems_are_all_reported(self):
+        problems = verify.charge_consistency_problems(
+            self.acid, {"O1": -1, "O99": -1, "O2": -1})
+        self.assertEqual(len(problems), 2, problems)
+
+    def test_the_builder_refuses_a_charged_carbonyl_oxygen(self):
+        """End to end through the builder, and before RDKit is imported.
+
+        The invalid fixture is kept as a negative test rather than made to
+        pass. A doubly bonded carbonyl oxygen has no acidic proton, so a -1
+        charge on it with its bond order left unchanged is an invalid charge
+        and bond-order assignment for this model: it asks for valence 2 and
+        charge -1 on one oxygen, which the valence model cannot satisfy. The
+        diagnostic must name the atom rather than leaving RDKit's atom index
+        to be worked out.
+        """
+        with self.assertRaises(verify.VerificationError) as caught:
+            verify.expected_molecule_from_dictionary(
+                self.acid, {"O1": -1},
+                {"C1": (0.0, 0.0, 0.0), "C2": (1.52, 0.0, 0.0),
+                 "O1": (2.15, 1.05, 0.0), "O2": (2.15, -1.05, 0.0)})
+        message = str(caught.exception)
+        self.assertIn("O1", message)
+        self.assertIn("no acidic proton", message)
+        self.assertIn("cannot be reconciled", message)
+
+    def test_the_builder_refuses_a_charge_on_an_unknown_atom(self):
+        with self.assertRaises(verify.VerificationError) as caught:
+            verify.expected_molecule_from_dictionary(
+                self.acid, {"O99": -1},
+                {"C1": (0.0, 0.0, 0.0), "C2": (1.52, 0.0, 0.0),
+                 "O1": (2.15, 1.05, 0.0), "O2": (2.15, -1.05, 0.0)})
+        self.assertIn("not in ACT", str(caught.exception))
+
+    def test_the_rule_follows_the_dictionary_not_the_element(self):
+        """An oxygen is chargeable because it is an acid, not because it is O.
+
+        The same connection table with the hydrogen declared on the carbonyl
+        instead would make that oxygen the acid, and the check follows the
+        dictionary rather than assuming which oxygen is which.
+        """
+        unusual = self.component({"O1": ("HO1",)})
+        self.assertEqual(
+            verify.charge_consistency_problems(unusual, {"O1": -1}), [])
+        self.assertEqual(
+            len(verify.charge_consistency_problems(unusual, {"O2": -1})), 1)
+
+
 class StereoComparisonTests(unittest.TestCase):
     def test_agreement_on_every_centre_passes(self):
         result = verify.compare_stereocentres(
@@ -946,15 +1050,70 @@ class RdkitRepresentationTests(unittest.TestCase):
                          "a changed C5-C6 bond order must still be reported")
         self.assertTrue(report["bond_order_differences"])
 
+    @staticmethod
+    def acid_component():
+        """Acetic acid: a carboxyl whose hydroxyl oxygen can lose a proton.
+
+        This is the shape of every oxygen UMA actually deprotonates - `O2A`
+        and `O2B` on phosphorus, `O20` on the alanine carboxyl - each a
+        **single-bonded** oxygen bearing a hydrogen. Charging such an oxygen
+        leaves valence 1 with charge -1, which is what an anionic oxygen
+        permits.
+        """
+        import chemical_component
+        import chemical_graph
+        names = ["C1", "C2", "O1", "O2"]
+        elements = {"C1": "C", "C2": "C", "O1": "O", "O2": "O"}
+        graph = chemical_graph.graph_from_bond_names(
+            names, [elements[name] for name in names],
+            [("C1", "C2", "SING"), ("C2", "O1", "DOUB"), ("C2", "O2", "SING")])
+        return chemical_component.ChemicalComponent(
+            identifier="ACT", name="acetic acid", formula="C2 H4 O2",
+            dictionary_formal_charge=0, graph=graph, elements=elements,
+            hydrogens_on={"O2": ("HO2",)},
+            stereocentres={}, aromatic_atoms=(), n_hydrogens=4,
+            source_path="in-memory fixture")
+
+    @staticmethod
+    def acid_positions():
+        return {"C1": (0.0, 0.0, 0.0), "C2": (1.52, 0.0, 0.0),
+                "O1": (2.15, 1.05, 0.0), "O2": (2.15, -1.05, 0.0)}
+
     def test_the_modelled_charges_reach_the_expected_molecule(self):
-        """Protonation state and formal charges must be preserved, not dropped."""
+        """Protonation state and formal charges must be preserved, not dropped.
+
+        The charge is placed on a single-bonded hydroxyl oxygen, which is the
+        only kind UMA's chosen states deprotonate. An earlier version of this
+        test charged a doubly bonded carbonyl oxygen, which is not a valid
+        molecule; that case is now a negative test below.
+        """
         from rdkit import Chem
-        component = self.uracil_component()
-        positions = self.ring_positions()
-        molecule, snapshot_built, _ = verify.expected_molecule_from_dictionary(
-            component, {"O2": -1}, positions)
+        component = self.acid_component()
+        molecule, snapshot_built, index = \
+            verify.expected_molecule_from_dictionary(
+                component, {"O2": -1}, self.acid_positions())
         self.assertEqual(Chem.GetFormalCharge(molecule), -1)
         self.assertEqual(snapshot_built.formal_charge, -1)
+        charged = molecule.GetAtomWithIdx(index["O2"])
+        self.assertEqual(charged.GetSymbol(), "O")
+        self.assertEqual(charged.GetFormalCharge(), -1)
+        self.assertEqual(charged.GetTotalNumHs(), 0,
+                         "a deprotonated oxygen carries no hydrogen")
+        # The carbonyl oxygen is untouched and still neutral.
+        self.assertEqual(
+            molecule.GetAtomWithIdx(index["O1"]).GetFormalCharge(), 0)
+
+    def test_the_neutral_form_sanitises_too(self):
+        """The same fixture with no charges must also be a valid molecule."""
+        from rdkit import Chem
+        molecule, snapshot_built, index = \
+            verify.expected_molecule_from_dictionary(
+                self.acid_component(), {}, self.acid_positions())
+        self.assertEqual(Chem.GetFormalCharge(molecule), 0)
+        self.assertEqual(snapshot_built.formal_charge, 0)
+        self.assertEqual(
+            molecule.GetAtomWithIdx(index["O2"]).GetTotalNumHs(), 1,
+            "the neutral hydroxyl keeps its hydrogen")
 
 
 class RdkitAbsenceTests(unittest.TestCase):
