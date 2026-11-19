@@ -55,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_geometry
 import chemical_component
 import chemical_graph
+import ligand_atom_map
 import receptor_provenance as provenance
 
 RECOVERY_CRITERION_ANGSTROM = 2.0
@@ -73,7 +74,9 @@ class Pose:
     source: str
 
 
-def parse_pose_file(path: Path) -> list[dict[str, object]]:
+def parse_pose_file(path: Path,
+                   names_by_serial: dict[int, str] | None = None
+                   ) -> list[dict[str, object]]:
     """Read a multi-model ligand PDBQT written by Vina.
 
     Vina writes one `MODEL`/`ENDMDL` block per retained pose, in rank order,
@@ -103,6 +106,22 @@ def parse_pose_file(path: Path) -> list[dict[str, object]]:
             element_or_type = line[77:80].strip().upper()
             if element_or_type in ("HD", "H") or name.upper().startswith("H"):
                 continue
+            if names_by_serial is not None:
+                # Docked poses inherit the prepared ligand's atom records, and
+                # Meeko writes the element in the name column, so names there
+                # are not unique. The validated serial mapping is used instead.
+                try:
+                    serial = int(line[6:11])
+                except ValueError as error:
+                    raise chemical_graph.CorrespondenceError(
+                        f"{path} line {number}: unreadable atom serial ({error})")
+                mapped = names_by_serial.get(serial)
+                if mapped is None:
+                    raise chemical_graph.CorrespondenceError(
+                        f"{path} line {number}: heavy-atom serial {serial} has "
+                        f"no entry in the atom map; the map does not cover "
+                        f"this pose file")
+                name = mapped
             try:
                 position = (float(line[30:38]), float(line[38:46]),
                             float(line[46:54]))
@@ -125,7 +144,8 @@ def parse_pose_file(path: Path) -> list[dict[str, object]]:
     return poses
 
 
-def collect_poses(run_directory: Path, ligand: str) -> list[Pose]:
+def collect_poses(run_directory: Path, ligand: str,
+                  names_by_serial: dict[int, str] | None = None) -> list[Pose]:
     """Gather every retained pose of every seed from a docking run directory.
 
     Expects the layout `dock.py` writes: `poses/seed_<N>/<ligand>_docked.pdbqt`.
@@ -145,7 +165,8 @@ def collect_poses(run_directory: Path, ligand: str) -> list[Pose]:
         if not pose_file.is_file():
             continue
         seeds_found.append(seed)
-        for rank, entry in enumerate(parse_pose_file(pose_file), start=1):
+        for rank, entry in enumerate(
+                parse_pose_file(pose_file, names_by_serial), start=1):
             poses.append(Pose(seed=seed, rank=rank,
                               score=entry["score"],
                               coordinates=entry["coordinates"],
@@ -312,6 +333,60 @@ def validated_stereo_verification(path: Path | None,
     }
 
 
+def pose_linkage(atom_map_record: dict, run_record: dict,
+                 run_record_path: Path) -> dict[str, object]:
+    """Link docked poses to the prepared ligand through campaign provenance.
+
+    A docked pose file is Vina's **output**. It has its own hash and does not
+    carry the prepared ligand's, so an atom map must not be required to
+    hash-match the pose files; `read_atom_map` is therefore called without
+    `expected_pdbqt` here, unlike in the preparation check where the PDBQT
+    being examined *is* the prepared input.
+
+    What does establish the link is the docking run's own record, which lists
+    every ligand input with its SHA-256. If the hash the atom map was built
+    against appears there, the poses in that directory were docked from the
+    ligand the map describes. If it does not, the poses may still be fine but
+    nothing ties them to the verified input, and that is reported rather than
+    assumed either way.
+    """
+    recorded = (atom_map_record.get("inputs", {}) or {}).get(
+        "prepared_pdbqt_sha256")
+    requirement = ("the atom map's prepared-ligand hash appears among the "
+                   "docking run's recorded ligand inputs")
+    if not run_record:
+        return {"established": False, "requirement": requirement,
+                "reason": f"no run record at {run_record_path}, so the "
+                          f"campaign's ligand inputs are unknown"}
+    if not recorded:
+        return {"established": False, "requirement": requirement,
+                "reason": "the atom map records no prepared-ligand hash"}
+    inputs = run_record.get("ligand_inputs") or []
+    hashes = {}
+    for entry in inputs:
+        if isinstance(entry, dict) and entry.get("sha256"):
+            hashes[entry["sha256"]] = entry.get("path")
+    if recorded in hashes:
+        return {
+            "established": True,
+            "requirement": requirement,
+            "prepared_pdbqt_sha256": recorded,
+            "matched_campaign_input": hashes[recorded],
+            "note": ("the poses were docked from the ligand this map "
+                     "describes; pose files carry their own hashes and are "
+                     "not compared against the input's"),
+        }
+    return {
+        "established": False,
+        "requirement": requirement,
+        "prepared_pdbqt_sha256": recorded,
+        "campaign_ligand_inputs": sorted(hashes.values()),
+        "reason": ("the atom map was built against a prepared ligand whose "
+                   "hash is not among this run's recorded ligand inputs; the "
+                   "poses may not come from the ligand the map describes"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -335,6 +410,11 @@ def main() -> None:
                         default=RECOVERY_CRITERION_ANGSTROM,
                         help=f"RMSD criterion in A (default "
                              f"{RECOVERY_CRITERION_ANGSTROM})")
+    parser.add_argument("--atom-map", type=Path,
+                        help="Validated atom-map record from "
+                             "prepare_ligand.py atom-map. Required when the "
+                             "docked poses carry element names rather than "
+                             "atom names, which is what Meeko writes")
     parser.add_argument("--stereo-verification", type=Path,
                         help="Record of the stereochemistry check against the "
                              "stereo plan. A prerequisite for interpreting "
@@ -405,14 +485,44 @@ def run(args: argparse.Namespace) -> None:
         component.graph, hydrogen_bearing=still_protonated)
     permutations = chemical_graph.automorphisms(graph)
 
-    poses = collect_poses(args.run_directory, args.ligand)
+    # Read the campaign record first: it is what links docked poses back to
+    # the prepared ligand. A pose file is Vina's output and has its own hash;
+    # it is not expected to carry the prepared input's hash, and demanding
+    # that would be wrong.
+    run_record_path = args.run_directory / "run_record.json"
+    run_record: dict[str, object] = {}
+    if run_record_path.is_file():
+        run_record = json.loads(run_record_path.read_text())
+
+    names_by_serial = None
+    atom_map_provenance: dict[str, object] = {
+        "basis": "atom names in the pose files",
+        "atom_map_record": None,
+        "note": ("no --atom-map was supplied, so pose atom names were used "
+                 "directly and were required to match the reference"),
+    }
+    if args.atom_map:
+        atom_map_record = ligand_atom_map.read_atom_map(args.atom_map)
+        names_by_serial = ligand_atom_map.name_by_serial(atom_map_record)
+        atom_map_provenance = {
+            "basis": "validated Meeko index map, serial to reference name",
+            "atom_map_record": str(Path(args.atom_map).resolve()),
+            "atom_map_record_sha256": box_geometry.file_sha256(args.atom_map),
+            "prepared_pdbqt_sha256": (atom_map_record.get("inputs", {}) or {}).get(
+                "prepared_pdbqt_sha256"),
+            "n_heavy_atoms_mapped": len(names_by_serial),
+            "note": ("pose files inherit the prepared ligand's atom records, "
+                     "whose name column holds the element; names there are "
+                     "not unique and are not used"),
+            "pose_linkage": pose_linkage(atom_map_record, run_record,
+                                         run_record_path),
+        }
+    poses = collect_poses(args.run_directory, args.ligand, names_by_serial)
     analysis = analyse(reference_atoms, graph, permutations, poses,
                        args.criterion)
 
-    run_record_path = args.run_directory / "run_record.json"
     docking_context: dict[str, object] = {}
-    if run_record_path.is_file():
-        run_record = json.loads(run_record_path.read_text())
+    if run_record:
         docking_context = {
             "box_centre_angstrom": run_record.get("box_centre_angstrom"),
             "box_size_angstrom": run_record.get("box_size_angstrom"),
@@ -469,6 +579,7 @@ def run(args: argparse.Namespace) -> None:
                 "structures are the same stereoisomer. CIP codes assigned "
                 "from 3D coordinates must be compared at the preparation "
                 "stage"),
+            "atom_correspondence": atom_map_provenance,
             "independent_validation": (
                 "this is a custom implementation whose tests are not "
                 "independent of it; compare against an established toolkit "
@@ -508,6 +619,15 @@ def run(args: argparse.Namespace) -> None:
     if docking_context:
         print(f"box              : size {docking_context.get('box_size_angstrom')} A,"
               f" receptor condition {docking_context.get('receptor_condition')!r}")
+    linkage = (record["measure"]["atom_correspondence"].get("pose_linkage")
+               if isinstance(record["measure"]["atom_correspondence"], dict)
+               else None)
+    if linkage:
+        if linkage.get("established"):
+            print(f"pose provenance  : linked to the prepared ligand through "
+                  f"the campaign record")
+        else:
+            print(f"pose provenance  : NOT established - {linkage.get('reason')}")
     print()
     header = (f"{'seed':>6}{'poses':>7}{'top rank':>10}{'top score':>11}"
               f"{'top RMSD':>10}{'crit':>6}{'closest rank':>14}"

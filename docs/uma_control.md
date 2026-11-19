@@ -566,19 +566,78 @@ mk_prepare_ligand.py -i ligands/uma_verified_withH.mol -o ligands/uma.pdbqt
 echo "exit status: $?"
 ```
 
+### Stage 5b — the atom map (nothing extra)
+
+Meeko writes the **element** in a PDBQT's atom-name column, so a prepared UMA
+has 49 heavy atoms sharing five names (`C`, `H`, `N`, `O`, `P`). No name-keyed
+correspondence is possible against it, and `check` refuses such a file rather
+than collapsing the duplicates — a collapsed duplicate would leave a name set
+that still matched the reference while a record was silently discarded.
+
+The route through is Meeko's own index map, which is why stage 5 passes
+`--add_index_map`:
+
+```bash
+python python/prepare_ligand.py atom-map \
+    ligands/uma.ligand.json \
+    ligands/uma_verified_v2.verification.json \
+    ligands/uma_minus3_try1.pdbqt \
+    --out ligands/uma.atom_map.json \
+    --preparation-command "mk_prepare_ligand.py -i ligands/uma_verified_v2_withH.mol -o ligands/uma_minus3_try1.pdbqt --charge_model gasteiger --add_index_map"
+```
+
+This composes `PDBQT serial -> input molfile atom index -> reference atom
+name` and validates every link. The original PDBQT is read only.
+
+**Index-map semantics, established from the real output rather than assumed.**
+For the UMA preparation, `REMARK INDEX MAP` pairs read **(input atom index,
+PDBQT serial)**, both **1-based**, with the serial column being the atoms in
+file order. Confirmed two ways: every element agrees, and the coordinates
+agree exactly — serial 1 is input atom 22, which is `PB`, at
+`23.570 −3.765 50.318`, the deposited `PB` position.
+
+The direction is still re-derived on every run, by asking which column is
+exactly the PDBQT's serials. If both columns are permutations of `1..n`, the
+two readings are compared: identical readings mean the direction is immaterial
+and are accepted; differing readings are refused rather than guessed.
+
+What the stage requires before writing a mapping:
+
+- the verification record says `passed`, and its ligand-manifest hash matches;
+- the hydrogenated molfile's hash matches what was verified;
+- that molfile's heavy atoms match the reference by element **and** coordinate,
+  so its positional order is checked rather than trusted;
+- PDBQT serials are unique and each appears once in the map;
+- a **bijection over all 49 heavy atoms** — no reference atom unreached, no two
+  serials reaching the same name;
+- elements and coordinates agree for every mapped pair, within 0.002 Å.
+
+**Merged hydrogens are expected, not failures.** Meeko merges non-polar
+hydrogens into their parent heavy atom, so the input's hydrogens outnumber the
+PDBQT's. The real case: 82 input atoms to 56 PDBQT atoms, with 7 polar
+hydrogens mapped and **26 merged**. Those are counted and listed in the record.
+
+The mapping is specific to one PDBQT and one input molfile, both hashed in the
+record, and must not be reused across a re-preparation.
+
 ### Stage 6 — preparation verification (nothing extra)
 
 ```bash
 python python/prepare_ligand.py check \
-    ligands/uma.ligand.json ligands/uma.pdbqt \
+    ligands/uma.ligand.json ligands/uma_minus3_try1.pdbqt \
+    --atom-map ligands/uma.atom_map.json \
     --charge-model gasteiger \
     --preparation-command "mk_prepare_ligand.py -i ligands/uma_verified_withH.mol -o ligands/uma.pdbqt"
 ```
 
-Refuses to pass if a heavy atom moved beyond 0.002 Å from the reference, if a
-heavy atom is missing or unexpected, if an atom name is **repeated** — a
-duplicate record would otherwise collapse into a name set that still matched —
-or if the partial charges do not sum to the recorded formal charge. Records the
+With `--atom-map`, atoms are keyed by the validated mapping. **Without it the
+name-based check stays strict** and refuses a repeated atom name, which is the
+right behaviour for a ligand whose names survived preparation and the right
+refusal for one whose names did not.
+
+Either way it refuses to pass if a heavy atom moved beyond 0.002 Å from the
+reference, if a heavy atom is missing or unexpected, or if the partial charges
+do not sum to the recorded formal charge. Records the
 hydrogens added, the AutoDock type census, the charge sum, `TORSDOF` and the
 `BRANCH` count.
 
@@ -694,11 +753,34 @@ for SIZE in 24 30 33; do
       --reference references/uma_chainE.reference.json \
       --component-dictionary <CCD>/UMA.cif \
       --ligand-manifest ligands/uma.ligand.json \
-      --stereo-verification ligands/uma_verified.verification.json \
+      --atom-map ligands/uma.atom_map.json \
+      --stereo-verification ligands/uma_verified_v2.verification.json \
       --independent-rmsd analysis/uma.independent_rmsd.json \
       --out analysis/uma_control_${SIZE}A
 done
 ```
+
+### Pose provenance: by campaign record, not by file hash
+
+A docked pose file is Vina's **output**. It has its own hash and does not
+carry the prepared ligand's, so the analysis must not require the atom map to
+hash-match the pose files. It does not: `--atom-map` is read without naming a
+file it should describe, whereas the preparation check reads it while naming
+the PDBQT being examined, which *is* the prepared input.
+
+What establishes the link is the docking run's own `run_record.json`, which
+lists every ligand input with its SHA-256. If the hash the atom map was built
+against appears there, the poses in that directory were docked from the ligand
+the map describes, and the analysis record says so. If it does not, the poses
+may still be sound but nothing ties them to the verified input, and the
+analysis prints
+
+```
+pose provenance  : NOT established - the atom map was built against a prepared
+ligand whose hash is not among this run's recorded ligand inputs
+```
+
+rather than assuming either way.
 
 ## How to read the result
 
@@ -748,7 +830,7 @@ Interpretation limits, which the analysis record also carries:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-252 tests, 5 of which require RDKit and skip without it. What they do and
+287 tests, 5 of which require RDKit and skip without it. What they do and
 do not establish, kept apart deliberately:
 
 | Suite | Needs | Covers |
@@ -756,6 +838,7 @@ do not establish, kept apart deliberately:
 | `tests/test_uma_control.py` | nothing / Gemmi | the molecular graph, resonance normalisation restricted to deprotonated groups, automorphism enumeration, in-place RMSD, pose-file parsing, the recovery logic, dictionary reading, reference extraction, both ligand stages and the stereo plan |
 | `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, the raw molfile bond-order reader, bond-order vocabulary normalisation, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the five input-identity guards run end to end |
 | `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule in both the charged and the neutral form. **Skipped without RDKit, so never executed on the Mac** |
+| `tests/test_ligand_atom_map.py` | nothing | the Meeko index map: direction derivation including the ambiguous and immaterial cases, reordered atoms, missing and duplicate entries, a map from the wrong input, merged hydrogens, the record's tie to its PDBQT by hash, and the campaign-provenance linkage for docked poses |
 | `tests/test_ligand_verification.py::ChargeConsistencyTests` | nothing / Gemmi | that a negative charge is only accepted on an atom bearing an acidic proton, reported with the atom's name and bonds rather than RDKit's atom index |
 | `tests/test_ligand_verification.py::RdkitAbsenceTests` | RDKit **absent** | the diagnostic given when RDKit is missing. Skips wherever RDKit is installed |
 
@@ -765,8 +848,8 @@ absence. Exactly one of the two groups runs anywhere:
 
 | Machine | Ran | Skipped | Which |
 | --- | --- | --- | --- |
-| Mac (no RDKit) | 252 | 5 | the five `RdkitRepresentationTests` |
-| Epicac (`boltz`, RDKit present) | 252 | **1** | `RdkitAbsenceTests` only |
+| Mac (no RDKit) | 287 | 5 | the five `RdkitRepresentationTests` |
+| Epicac (`boltz`, RDKit present) | 287 | **1** | `RdkitAbsenceTests` only |
 
 An Epicac run reporting more than one skip means something else is being
 skipped and is worth reading: before this revision, five `InputGuardTests`

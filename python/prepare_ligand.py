@@ -58,6 +58,7 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_geometry
 import chemical_component
+import ligand_atom_map
 import chemical_graph
 import receptor_provenance as provenance
 
@@ -324,13 +325,71 @@ def parse_pdbqt_ligand(path: Path) -> dict[str, object]:
             "torsdof": torsdof}
 
 
+def read_pdbqt_torsions(path: Path) -> dict[str, object]:
+    """Read TORSDOF and the BRANCH count, independently of atom naming.
+
+    Needed on both correspondence paths: the torsion tree is a property of the
+    file, not of how its atoms happen to be keyed.
+    """
+    branches = 0
+    torsdof: int | None = None
+    for line in Path(path).read_text().splitlines():
+        if line.startswith("BRANCH"):
+            branches += 1
+        elif line.startswith("TORSDOF"):
+            fields = line.split()
+            if len(fields) >= 2:
+                torsdof = int(fields[1])
+    return {"torsdof": torsdof, "n_branch_records": branches}
+
+
+def _atoms_by_atom_map(atom_map_path: Path, pdbqt_path: Path):
+    """Re-key a prepared PDBQT's atoms by reference name, via the atom map.
+
+    Returns the same shape `parse_pdbqt_ligand` produces, so the checks that
+    follow are identical whichever route supplied the names. Hydrogens keep
+    their serials as keys, prefixed, because they have no reference name: they
+    are counted and recorded, never compared.
+    """
+    record = ligand_atom_map.read_atom_map(atom_map_path,
+                                           expected_pdbqt=pdbqt_path)
+    names = ligand_atom_map.name_by_serial(record)
+    atoms: dict[str, dict[str, object]] = {}
+    hydrogens: set[str] = set()
+    for atom in ligand_atom_map.read_pdbqt_atoms(pdbqt_path):
+        key = names.get(atom.serial)
+        if key is None:
+            if not atom.is_hydrogen:
+                raise LigandError(
+                    f"PDBQT serial {atom.serial} ({atom.name}) is a heavy atom "
+                    f"with no entry in {atom_map_path}; the mapping does not "
+                    f"cover this file")
+            key = f"H#{atom.serial}"
+            hydrogens.add(key)
+        atoms[key] = {
+            "element_or_type": atom.autodock_type,
+            "charge": atom.charge,
+            "coordinates": atom.position,
+            "residue_name": "",
+            "pdbqt_serial": atom.serial,
+        }
+    return atoms, hydrogens, {
+        "basis": "validated Meeko index map, serial to reference name",
+        "atom_map_record": str(atom_map_path),
+        "atom_map_record_sha256": box_geometry.file_sha256(atom_map_path),
+        "n_heavy_atoms_mapped": len(names),
+        "index_map_direction": (record.get("index_map", {}) or {}).get("direction"),
+        "input_hydrogens_merged": (record.get("counts", {}) or {}).get(
+            "input_hydrogens_merged"),
+        "note": ("the PDBQT's atom-name column holds the element, so names "
+                 "there are not unique and are not used for correspondence"),
+    }
+
+
 def check(args: argparse.Namespace) -> None:
     """Stage 2: verify the prepared PDBQT and record what it contains."""
     manifest = provenance.read_manifest_like(args.ligand_manifest,
                                              expected_schema=LIGAND_SCHEMA)
-    prepared = parse_pdbqt_ligand(args.prepared_pdbqt)
-    atoms = prepared["atoms"]
-
     reference_atoms = {
         name: tuple(entry["coordinates_angstrom"]) for name, entry
         in provenance.read_manifest_like(
@@ -338,11 +397,33 @@ def check(args: argparse.Namespace) -> None:
             expected_schema=None)["atom_mapping"].items()
     }
     expected_heavy = set(reference_atoms)
-    hydrogens = {name for name, entry in atoms.items()
-                 if str(entry["element_or_type"]).upper() in ("HD", "H")
-                 or name.upper().startswith("H")}
-    heavy_present = set(atoms) - hydrogens
+    tolerance = args.coordinate_tolerance
 
+    torsions = read_pdbqt_torsions(args.prepared_pdbqt)
+
+    if args.atom_map:
+        # Serial-keyed, via the validated mapping. Meeko writes the element in
+        # the atom-name column, so a prepared ligand has 49 heavy atoms
+        # sharing five names and no name-keyed comparison is possible.
+        atoms, hydrogens, correspondence = _atoms_by_atom_map(
+            args.atom_map, args.prepared_pdbqt)
+    else:
+        # Name-keyed, and deliberately strict: a repeated name is refused
+        # rather than collapsed. This path is right for a ligand whose names
+        # survived preparation, and refuses one whose names did not.
+        prepared = parse_pdbqt_ligand(args.prepared_pdbqt)
+        atoms = prepared["atoms"]
+        hydrogens = {name for name, entry in atoms.items()
+                     if str(entry["element_or_type"]).upper() in ("HD", "H")
+                     or name.upper().startswith("H")}
+        correspondence = {
+            "basis": "atom names in the prepared PDBQT",
+            "atom_map_record": None,
+            "note": ("no --atom-map was supplied, so names were required to "
+                     "match the reference exactly"),
+        }
+
+    heavy_present = set(atoms) - hydrogens
     missing = sorted(expected_heavy - heavy_present)
     unexpected = sorted(heavy_present - expected_heavy)
     if missing or unexpected:
@@ -358,7 +439,6 @@ def check(args: argparse.Namespace) -> None:
                                         reference_atoms[name])
         if deviation > worst:
             worst, worst_atom = deviation, name
-    tolerance = args.coordinate_tolerance
     preserved = worst <= tolerance
 
     charge_sum = sum(float(entry["charge"]) for entry in atoms.values())
@@ -381,8 +461,8 @@ def check(args: argparse.Namespace) -> None:
         "partial_charge_sum": round(charge_sum, 4),
         "expected_formal_charge": expected_charge,
         "charge_sum_matches_formal_charge": abs(charge_sum - expected_charge) < 0.05,
-        "torsdof": prepared["torsdof"],
-        "n_branch_records": prepared["n_branch_records"],
+        "torsdof": torsions["torsdof"],
+        "n_branch_records": torsions["n_branch_records"],
         "heavy_atom_coordinates": {
             "max_deviation_from_reference_angstrom": round(worst, 6),
             "max_deviation_atom": worst_atom,
@@ -391,6 +471,7 @@ def check(args: argparse.Namespace) -> None:
         },
         "partial_charge_model": args.charge_model,
         "preparation_command": args.preparation_command,
+        "atom_correspondence": correspondence,
         "not_validated_here": [
             "atom typing correctness",
             "partial-charge model appropriateness",
@@ -407,8 +488,8 @@ def check(args: argparse.Namespace) -> None:
     print(f"  type census    : {dict(sorted(types.items()))}")
     print(f"  charge sum     : {charge_sum:+.4f} against an expected formal "
           f"charge of {expected_charge:+d}")
-    print(f"  TORSDOF        : {prepared['torsdof']}, "
-          f"{prepared['n_branch_records']} BRANCH records")
+    print(f"  TORSDOF        : {torsions['torsdof']}, "
+          f"{torsions['n_branch_records']} BRANCH records")
     print(f"  max deviation  : {worst:.4f} A from the reference "
           f"(tolerance {tolerance} A) at {worst_atom}")
     print(f"manifest updated : {args.ligand_manifest}")
@@ -605,6 +686,104 @@ def stereo_plan(args: argparse.Namespace) -> None:
           "before\ninterpreting any docking result. See docs/uma_control.md.")
 
 
+def atom_map(args: argparse.Namespace) -> None:
+    """Build and record the validated PDBQT-serial to reference-name mapping.
+
+    Meeko writes the element in a PDBQT's atom-name column, so a prepared
+    ligand has 49 heavy atoms sharing five names and no name-keyed
+    correspondence is possible against it. This composes Meeko's own
+    `REMARK INDEX MAP` with the input molfile's heavy-atom order, validating
+    every link, and writes the result for the check and analysis stages.
+    """
+    manifest = provenance.read_manifest_like(args.ligand_manifest, LIGAND_SCHEMA)
+    verification = provenance.read_manifest_like(
+        args.verification_record, "mur-ligase-ligand-verification/1")
+    if verification.get("result") != "passed":
+        raise LigandError(
+            f"{args.verification_record} records result "
+            f"{verification.get('result')!r}; a mapping must not be built on "
+            f"an unverified ligand")
+    recorded_manifest = (verification.get("inputs", {}) or {}).get(
+        "ligand_manifest_sha256")
+    actual_manifest = box_geometry.file_sha256(args.ligand_manifest)
+    if recorded_manifest and recorded_manifest != actual_manifest:
+        raise LigandError(
+            f"{args.verification_record} verified a different ligand manifest "
+            f"(recorded {recorded_manifest[:12]}..., given "
+            f"{actual_manifest[:12]}...)")
+
+    # The input Meeko was given is the hydrogenated molfile the verification
+    # wrote. Its hash is checked, and its heavy atoms are then validated
+    # against the reference directly rather than taken on trust.
+    molfile = Path(args.input_molfile or
+                   (verification.get("outputs", {}) or {}).get(
+                       "hydrogenated_molfile", ""))
+    if not molfile or not molfile.is_file():
+        raise LigandError(
+            f"the hydrogenated molfile is missing: {molfile!s}. It is the file "
+            f"Meeko was given and the mapping cannot be built without it.")
+    recorded_molfile = (verification.get("outputs", {}) or {}).get(
+        "hydrogenated_molfile_sha256")
+    actual_molfile = box_geometry.file_sha256(molfile)
+    if recorded_molfile and recorded_molfile != actual_molfile:
+        raise LigandError(
+            f"{molfile} has changed since it was verified (recorded "
+            f"{recorded_molfile[:12]}..., found {actual_molfile[:12]}...)")
+
+    reference = provenance.read_manifest_like(
+        Path(manifest["reference"]["path"]), None)
+    reference_atoms = {name: tuple(entry["coordinates_angstrom"])
+                       for name, entry in reference["atom_mapping"].items()}
+    reference_elements = {name: entry["element"]
+                          for name, entry in reference["atom_mapping"].items()}
+    component = chemical_component.read_component(
+        args.component_dictionary or manifest["dictionary"]["path"])
+
+    record = ligand_atom_map.build_atom_map(
+        args.prepared_pdbqt, molfile, component.heavy_atom_names,
+        reference_atoms, reference_elements,
+        tolerance=args.coordinate_tolerance)
+    record["provenance"] = {
+        "ligand_manifest": str(args.ligand_manifest),
+        "ligand_manifest_sha256": actual_manifest,
+        "verification_record": str(args.verification_record),
+        "verification_record_sha256": box_geometry.file_sha256(
+            args.verification_record),
+        "verification_result": verification.get("result"),
+        "component_dictionary": str(
+            args.component_dictionary or manifest["dictionary"]["path"]),
+        "reference_record": manifest["reference"]["path"],
+        "modelled_formal_charge":
+            manifest["protonation_state"]["modelled_formal_charge"],
+        "preparation_command": args.preparation_command,
+    }
+    destination = Path(args.out)
+    provenance.write_manifest(destination, record, overwrite=args.overwrite)
+
+    counts = record["counts"]
+    print(f"prepared PDBQT   : {args.prepared_pdbqt}")
+    print(f"input molfile    : {molfile}")
+    print(f"index map        : {record['index_map']['n_pairs']} pairs, "
+          f"{record['index_map']['direction']}")
+    print(f"  base           : {record['index_map']['index_base']}, "
+          f"direction established from the file, not assumed")
+    print(f"atoms            : PDBQT {counts['pdbqt_atoms']} "
+          f"({counts['pdbqt_hydrogens']} hydrogens), input "
+          f"{counts['input_atoms']} ({counts['input_heavy_atoms']} heavy, "
+          f"{counts['input_hydrogens']} hydrogens)")
+    print(f"heavy atoms mapped: {counts['heavy_atoms_mapped']} of "
+          f"{len(component.heavy_atom_names)}, bijective")
+    print(f"hydrogens merged : {counts['input_hydrogens_merged']} input "
+          f"hydrogens appear in no pair, as expected")
+    print(f"max deviation    : "
+          f"{record['checks']['max_coordinate_deviation_angstrom']} A "
+          f"(tolerance {record['checks']['tolerance_angstrom']} A)")
+    print(f"wrote            : {destination}")
+    print("\nPass this record to prepare_ligand.py check --atom-map and to "
+          "analyse_redocking.py\n--atom-map; neither can use the PDBQT's "
+          "repeated element names.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -632,6 +811,26 @@ def main() -> None:
                          help="Charge model the preparation used, for the record")
     checker.add_argument("--preparation-command", default="unrecorded",
                          help="Exact command used, for the record")
+    checker.add_argument("--atom-map", type=Path,
+                         help="Validated atom-map record from the atom-map "
+                              "stage. Required when preparation did not "
+                              "preserve atom names, which Meeko does not")
+
+    mapper = subparsers.add_parser(
+        "atom-map",
+        help="Build the validated PDBQT-serial to reference-name mapping")
+    mapper.add_argument("ligand_manifest", type=Path)
+    mapper.add_argument("verification_record", type=Path)
+    mapper.add_argument("prepared_pdbqt", type=Path)
+    mapper.add_argument("--out", type=Path, required=True)
+    mapper.add_argument("--input-molfile", type=Path,
+                        help="Defaults to the hydrogenated molfile the "
+                             "verification record names")
+    mapper.add_argument("--component-dictionary", type=Path)
+    mapper.add_argument("--coordinate-tolerance", type=float,
+                        default=ligand_atom_map.COORDINATE_TOLERANCE_ANGSTROM)
+    mapper.add_argument("--preparation-command", default="unrecorded")
+    mapper.add_argument("--overwrite", action="store_true")
 
     planner = subparsers.add_parser(
         "stereo-plan",
@@ -651,11 +850,13 @@ def main() -> None:
             build(args)
         elif args.stage == "check":
             check(args)
+        elif args.stage == "atom-map":
+            atom_map(args)
         else:
             stereo_plan(args)
     except (LigandError, chemical_component.ComponentError,
             chemical_graph.CorrespondenceError, provenance.ReceptorError,
-            box_geometry.BoxError) as error:
+            box_geometry.BoxError, ligand_atom_map.AtomMapError) as error:
         sys.exit(f"error: {error}")
 
 
