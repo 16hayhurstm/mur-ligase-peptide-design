@@ -230,14 +230,42 @@ independently convenient.
 
 Every command below is the real CLI, taken from `--help`. Stages 1, 2 and 3
 need only Gemmi and run anywhere; stage 4 needs RDKit; stage 5 needs Meeko;
-stage 6 needs neither. Only stage 7 docks, and it is not part of this
-milestone.
+stage 6 needs neither; stage 7 needs RDKit again. **Stages 1-7 are the
+current milestone.** Docking is stage 8 and is not part of it.
+
+### Getting the code onto the validation machine
+
+The validation checkout is a **detached worktree**, not a branch-tracking
+clone, so `git pull` is the wrong command: there is no upstream branch to
+merge into and the worktree is deliberately pinned to one commit. Fetch, then
+switch to the exact commit being validated:
+
+```bash
+cd <validation worktree>
+git fetch origin
+git switch --detach <commit>
+git log --oneline -1          # confirm it is the commit you intended
+git status --short            # expect clean; generated outputs are ignored
+```
+
+Pinning to an explicit commit is the point: every manifest and record written
+below carries input hashes, and the code revision that produced them has to be
+identifiable too. Note the commit hash alongside the results.
+
+### Output directories
+
+The scripts do create their own output directories, but creating them up front
+keeps the paths below valid whatever order they are run in, and makes the
+layout explicit:
+
+```bash
+conda activate boltz
+mkdir -p components references ligands analysis runs
+```
 
 The component dictionary is fetched rather than transferred:
 
 ```bash
-conda activate boltz
-cd ~/murc-docking-validation
 ./scripts/02_fetch_component.sh UMA components
 # Expect sha256 1efc8757b1ffa8a82d060f6e68cf92de9e0ed345f022af4eb6566a22e1c32eaf
 ```
@@ -321,58 +349,118 @@ because phosphorus configuration of that kind is not configurationally stable
 in solution — a mismatch there is **investigated**, not treated as the wrong
 stereoisomer. A mismatch at any of the 11 carbons is fatal.
 
-### Stage 4 — RDKit checks and hydrogen addition (RDKit)
+### Stage 4 — RDKit verification and hydrogen addition (RDKit)
+
+This is the only step that perceives chemistry rather than reading it, and it
+is a single script rather than a snippet to adapt:
 
 ```bash
-python - <<'PY_INNER'
-import json
-from rdkit import Chem
-
-plan = json.load(open("ligands/uma.stereo_plan.json"))
-state = plan["states"]["modelled"]
-
-mol = Chem.MolFromMolFile("ligands/uma_ligand.mol", removeHs=False,
-                          sanitize=True)
-assert mol is not None, "RDKit could not read the molfile"
-charge = Chem.GetFormalCharge(mol)
-print("formal charge:", charge, "expected", state["formal_charge"])
-assert charge == state["formal_charge"], (
-    "the M CHG block was not applied; this is the neutral molecule")
-print("heavy atoms  :", mol.GetNumHeavyAtoms(), "expected 49")
-
-Chem.AssignStereochemistryFrom3D(mol)
-assigned = {}
-for atom in mol.GetAtoms():
-    if atom.HasProp("_CIPCode"):
-        name = atom.GetPropsAsDict().get("molFileAlias") or atom.GetIdx()
-        assigned[atom.GetIdx()] = (atom.GetSymbol(), atom.GetProp("_CIPCode"))
-
-# The molfile atom order is the dictionary's heavy-atom order, so index i
-# corresponds to the i-th name in the plan's dictionary ordering.
-names = [entry["atom"] for entry in state["must_match"]]
-print("\nmust-match centres:", names)
-print("assigned CIP codes by index:", assigned)
-print("\nCompare each must-match centre's code with declared_configuration")
-print("in the plan. Record the comparison; do not summarise it as a pass.")
-
-withH = Chem.AddHs(mol, addCoords=True)
-Chem.MolToMolFile(withH, "ligands/uma_withH.mol")
-print("\natoms with hydrogens:", withH.GetNumAtoms(),
-      "( added:", withH.GetNumAtoms() - mol.GetNumAtoms(), ")")
-PY_INNER
+python python/verify_ligand_rdkit.py \
+    ligands/uma.ligand.json \
+    ligands/uma.stereo_plan.json \
+    modelled \
+    --out-prefix ligands/uma_verified
+echo "verification exit status: $?"
 ```
 
-Write the comparison to `ligands/uma.stereo_verification.json` — the file
-`analyse_redocking.py --stereo-verification` later expects — recording, for
-every must-match centre, its declared and assigned configuration and whether
-they agree. **Atom-index to name mapping is the one thing to get right here**:
-the molfile's atom order is the dictionary's heavy-atom order, so confirm the
-correspondence explicitly rather than assuming RDKit preserved names.
+The −2 sensitivity state needs its **own** plan, because a plan records the
+SHA-256 of the manifest it was derived from and the script refuses a plan that
+was built from a different one. Generate it, then verify:
+
+```bash
+python python/prepare_ligand.py stereo-plan \
+    ligands/uma_minus2.ligand.json \
+    --out ligands/uma_minus2.stereo_plan.json \
+    --state comparison_minus3=O2A,O2B,O20
+
+python python/verify_ligand_rdkit.py \
+    ligands/uma_minus2.ligand.json \
+    ligands/uma_minus2.stereo_plan.json \
+    modelled \
+    --out-prefix ligands/uma_minus2_verified
+echo "verification exit status: $?"
+```
+
+In the −2 manifest's own plan, the state called `modelled` **is** the −2
+state; the extra `--state` adds −3 alongside it for comparison. The script
+checks that the named plan state's charge equals the manifest's modelled
+charge and refuses the pair otherwise, so a state and a molfile that describe
+different protonations cannot be verified against each other by accident.
+
+Comparing the two plans' `modelled` states is what shows `PB` moving between
+`not_stereogenic_at_this_state` at −3 and `must_match` at −2.
+
+#### What it checks, and in what order
+
+1. **Input identity** — the molfile's SHA-256 against the manifest, the
+   dictionary's against the manifest, and the plan's recorded manifest hash
+   against the manifest being used. A revised CCD entry or an edited molfile
+   stops the run.
+2. **Formal charge** must equal the manifest's modelled charge. **A charge of
+   0 where −3 was intended means the `M  CHG` block was not applied and the
+   molecule is the neutral form** — the single most likely silent failure in
+   this stage.
+3. **Heavy-atom count** against the reference, and the molfile must carry no
+   hydrogens yet.
+4. **Index-to-name correspondence, derived from the coordinates**, then
+   validated against elements and connectivity, and required to be a
+   bijection. The molfile has no atom names, so the mapping is matched by
+   position against the reference and *then* checked; it is never assumed from
+   file order, and the plan's stereocentre list is never used as an ordering.
+   The record states whether the derived mapping happened to equal file order.
+5. **Connectivity** against the dictionary through that mapping, with missing
+   bonds, unexpected bonds and bond-order differences reported separately.
+6. **Stereochemistry from 3D** — `AssignStereochemistryFrom3D` followed by
+   `rdCIPLabeler.AssignCIPLabels`, the accurate labeller, since the comparison
+   is against the dictionary's CIP configurations. Each centre is compared
+   per the state's plan.
+7. **Hydrogen addition** with `AddHs(addCoords=True)`: no embedding, no
+   conformer generation, no minimisation. Charge, stereochemistry and every
+   heavy-atom coordinate are then rechecked, and any change fails the run.
+
+#### A changed R/S label is not assumed to be an inversion
+
+Because step 4 verifies that every heavy atom sits where the deposited
+reference has it, a label difference found at step 6 **cannot be a physical
+inversion** — the geometry is the deposited geometry. The record says so
+explicitly and directs the investigation to CIP priority instead: the
+dictionary's labels describe the *neutral* component, and deprotonating a
+nearby acid can reorder priorities at a centre without moving anything. This
+matters most at `C21` and `C18`, which flank the alanine carboxylate.
+
+Differences are reported, never discarded, and never silently recast.
+
+#### Phosphorus is reported separately
+
+Carbon and phosphorus centres appear in separate lists in both the console
+output and the record, following the state's plan:
+
+- at **−3**, `PA` and `PB` are not stereogenic, and a label there is expected
+  to be absent or meaningless;
+- at **−2**, `PB` is formally stereogenic and appears under `must_match` with
+  `fatal_if_mismatched: false`, so a difference is **investigated** rather
+  than treated as the wrong stereoisomer.
+
+A mismatch at any of the 11 carbons is fatal and fails the run.
+
+#### Outputs
+
+`ligands/uma_verified_withH.mol` and `ligands/uma_verified.verification.json`.
+
+**A failed check writes the record with `result: "failed"`, does not write the
+hydrogenated molfile, and exits non-zero.** If an output from an earlier
+attempt exists it is renamed with a `.FAILED` suffix. There is no path by
+which a failure leaves something that looks usable, and the downstream
+analysis validates the record's `result` and its recorded input hashes rather
+than accepting any JSON file at that path.
+
+The record carries the RDKit version, every input hash, the output hash, the
+derived correspondence, all three check groups and the hydrogen count.
 
 ### Stage 5 — Meeko preparation (Meeko)
 
 ```bash
-mk_prepare_ligand.py -i ligands/uma_withH.mol -o ligands/uma.pdbqt
+mk_prepare_ligand.py -i ligands/uma_verified_withH.mol -o ligands/uma.pdbqt
 echo "exit status: $?"
 ```
 
@@ -382,7 +470,7 @@ echo "exit status: $?"
 python python/prepare_ligand.py check \
     ligands/uma.ligand.json ligands/uma.pdbqt \
     --charge-model gasteiger \
-    --preparation-command "mk_prepare_ligand.py -i ligands/uma_withH.mol -o ligands/uma.pdbqt"
+    --preparation-command "mk_prepare_ligand.py -i ligands/uma_verified_withH.mol -o ligands/uma.pdbqt"
 ```
 
 Refuses to pass if a heavy atom moved beyond 0.002 Å from the reference, if a
@@ -504,7 +592,7 @@ for SIZE in 24 30 33; do
       --reference references/uma_chainE.reference.json \
       --component-dictionary <CCD>/UMA.cif \
       --ligand-manifest ligands/uma.ligand.json \
-      --stereo-verification ligands/uma.stereo_verification.json \
+      --stereo-verification ligands/uma_verified.verification.json \
       --independent-rmsd analysis/uma.independent_rmsd.json \
       --out analysis/uma_control_${SIZE}A
 done
@@ -558,10 +646,48 @@ Interpretation limits, which the analysis record also carries:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-`tests/test_uma_control.py` covers the molecular graph, resonance
-normalisation, automorphism enumeration, in-place RMSD, pose-file parsing, the
-recovery logic, dictionary reading, reference extraction and both ligand
-stages. There is **no stub for a chemistry toolkit**: hydrogen placement, atom
-typing and partial charges are not exercised or imitated anywhere, and the
-`check` stage is tested against a hand-written PDBQT fixture, which proves the
-verification logic and nothing about the preparation.
+228 tests. What they do and do not establish, kept apart deliberately:
+
+| Suite | Needs | Covers |
+| --- | --- | --- |
+| `tests/test_uma_control.py` | nothing / Gemmi | the molecular graph, resonance normalisation restricted to deprotonated groups, automorphism enumeration, in-place RMSD, pose-file parsing, the recovery logic, dictionary reading, reference extraction, both ligand stages and the stereo plan |
+| `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the four input-identity guards run end to end against the real files |
+
+**The RDKit integration is not exercised by any test.** `MolFromMolFile`,
+`AssignStereochemistryFrom3D`, `rdCIPLabeler.AssignCIPLabels`,
+`AddHs(addCoords=True)` and `MolToMolFile` are reached only through the thin
+adapter in `verify_ligand_rdkit.py`, which is never executed in the suite:
+RDKit is not installed on the development machine. There is deliberately **no
+RDKit stub** — stubbing stereochemistry perception would assert chemistry that
+nothing in the suite can check, and could hide an interface error instead of
+revealing one.
+
+What *is* exercised locally on that path: the module imports, the argument
+handling, all four input-identity guards, and the failure route end to end.
+The guards deliberately run **before** RDKit is required, so a plan built from
+another manifest, a state whose charge contradicts the manifest, an unknown
+state name and an edited molfile each fail fast with a clear diagnostic
+whether or not a toolkit is present — and are tested. Running the script
+without RDKit then produces a `result: "failed"` record naming the missing
+dependency, writes no hydrogenated molfile, and exits non-zero, so the gating
+behaviour is tested even though the chemistry is not.
+
+The first real execution of the RDKit path will therefore be on Epicac. Treat
+its first run as an integration check in its own right: read the console
+output and the record before trusting either.
+
+**`index_to_name_correspondence.equals_file_order` is diagnostic, not a pass
+requirement.** The correspondence that matters is the one the script derives
+from coordinates and then validates against elements and connectivity, and a
+validated bijective mapping is correct whether or not it happens to coincide
+with file order. A `false` value simply records that the toolkit presented the
+atoms in a different order from the molfile, which is useful to know and
+changes nothing about the result. What must hold is that the mapping is
+bijective and validated, which the script enforces by failing otherwise;
+`equals_file_order` is reported so the observation is not lost, not as a
+condition to meet.
+
+Checks that need the real tools, and are therefore still pending: RDKit
+reading and sanitisation of the molfile, CIP assignment from 3D, hydrogen
+placement, Meeko atom typing and partial charges, and the independent RMSD
+comparison.

@@ -244,6 +244,74 @@ def analyse(reference_atoms: dict[str, tuple[float, float, float]],
     }
 
 
+def validated_stereo_verification(path: Path | None,
+                                  ligand_manifest: Path | None
+                                  ) -> dict[str, object]:
+    """Check a stereochemistry verification record, rather than its existence.
+
+    A file being present is not evidence. The record must carry the
+    verification schema, state `result: "passed"`, report no fatal mismatch,
+    and describe **the ligand manifest actually being analysed**, matched by
+    SHA-256. A record from a different ligand, a different protonation state
+    or a failed run does not satisfy the prerequisite.
+    """
+    requirement = ("a verification record from verify_ligand_rdkit.py whose "
+                   "result is 'passed', with no fatal stereochemistry "
+                   "mismatch, for the same ligand manifest being analysed")
+    if path is None:
+        return {"satisfied": False, "evidence": None, "requirement": requirement,
+                "reason": "no record supplied"}
+    try:
+        record = provenance.read_manifest_like(
+            path, "mur-ligase-ligand-verification/1")
+    except provenance.ReceptorError as error:
+        return {"satisfied": False, "evidence": str(path),
+                "requirement": requirement,
+                "reason": f"not a usable verification record: {error}"}
+
+    problems: list[str] = []
+    if record.get("result") != "passed":
+        problems.append(
+            f"the record's result is {record.get('result')!r}, not 'passed'"
+            + (f": {record.get('failure_reason')}"
+               if record.get("failure_reason") else ""))
+    fatal = ((record.get("checks", {}) or {})
+             .get("stereochemistry_before_hydrogens", {}) or {}).get(
+                 "fatal_mismatches") or []
+    if fatal:
+        problems.append(f"fatal stereochemistry mismatches at {fatal}")
+    if ligand_manifest is None:
+        problems.append("no --ligand-manifest given, so the record cannot be "
+                        "tied to the ligand being analysed")
+    else:
+        recorded = (record.get("inputs", {}) or {}).get("ligand_manifest_sha256")
+        actual = box_geometry.file_sha256(ligand_manifest)
+        if not recorded:
+            problems.append("the record carries no ligand manifest hash")
+        elif recorded != actual:
+            problems.append(
+                f"the record verifies a different ligand manifest "
+                f"(recorded {recorded[:12]}..., analysing {actual[:12]}...)")
+
+    investigation = ((record.get("checks", {}) or {})
+                     .get("stereochemistry_before_hydrogens", {}) or {}).get(
+                         "requires_investigation") or []
+    return {
+        "satisfied": not problems,
+        "evidence": str(Path(path).resolve()),
+        "requirement": requirement,
+        "reason": "; ".join(problems) if problems else "record validated",
+        "record_result": record.get("result"),
+        "record_state": record.get("state"),
+        "rdkit_version": (record.get("tools", {}) or {}).get("rdkit"),
+        "centres_requiring_investigation": investigation,
+        "note": ("centres requiring investigation do not block the "
+                 "prerequisite when none is fatal, but they are carried here "
+                 "so they are not lost"
+                 if investigation else None),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -356,16 +424,10 @@ def run(args: argparse.Namespace) -> None:
                 "receptor_provenance_verified"),
         }
 
+    stereo_status = validated_stereo_verification(
+        args.stereo_verification, args.ligand_manifest)
     prerequisites = {
-        "stereochemistry_verified": {
-            "satisfied": bool(args.stereo_verification),
-            "evidence": (None if not args.stereo_verification
-                         else str(Path(args.stereo_verification).resolve())),
-            "requirement": ("every must_match stereocentre in the plan from "
-                            "`prepare_ligand.py stereo-plan` compared against "
-                            "CIP codes assigned from the prepared 3D "
-                            "coordinates"),
-        },
+        "stereochemistry_verified": stereo_status,
         "independent_rmsd_comparison": {
             "satisfied": bool(args.independent_rmsd),
             "evidence": (None if not args.independent_rmsd
@@ -483,7 +545,10 @@ def run(args: argparse.Namespace) -> None:
         print("=" * 70)
         print("DO NOT INTERPRET THIS CONTROL YET. Outstanding prerequisites:")
         for name in outstanding:
-            print(f"  - {name}: {prerequisites[name]['requirement']}")
+            entry = prerequisites[name]
+            print(f"  - {name}: {entry['requirement']}")
+            if entry.get("reason"):
+                print(f"      reason: {entry['reason']}")
         print("The RMSD values above are computed, but an unverified")
         print("stereoisomer or an unvalidated RMSD implementation makes a")
         print("pass and a failure equally uninformative. Supply")

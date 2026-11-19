@@ -155,6 +155,14 @@ def build_reference(args: argparse.Namespace) -> None:
     pdb_path = args.out_prefix.with_name(args.out_prefix.name + "_reference.pdb")
     record_path = args.out_prefix.with_name(
         args.out_prefix.name + ".reference.json")
+    # Created here so a missing directory gives a diagnostic rather than an
+    # unhandled error from the structure writer, and so this script behaves
+    # like the other stages, which create their own output directory.
+    try:
+        pdb_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ReferenceError(
+            f"cannot create the output directory {pdb_path.parent}: {error}")
     for path in (pdb_path, record_path):
         if path.exists():
             raise ReferenceError(
