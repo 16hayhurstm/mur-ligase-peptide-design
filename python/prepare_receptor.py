@@ -68,6 +68,7 @@ Scientific limitations, which this script records rather than resolves
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -389,6 +390,7 @@ def run_meeko(pdb_path: Path, prefix: Path,
             line.strip() for line in output.splitlines()
             if "Template matching failed" in line
         ],
+        "residue_templates": residue_template_report(output),
     }
     if finished.returncode != 0:
         raise PreparationError(
@@ -396,6 +398,69 @@ def run_meeko(pdb_path: Path, prefix: Path,
             f"--- tool output ---\n{output.strip()}"
         )
     return record
+
+
+def residue_template_report(output: str) -> dict[str, object]:
+    """Extract Meeko's residue-template handling into a structured record.
+
+    Meeko 0.7.1 does not fail when a residue is absent from its template set.
+    It warns and builds a template instead:
+
+        RuntimeWarning: Input residues {'A:603': 'ANP'} not in residue_templates
+        RuntimeWarning: Trying to resolve unknown residues by building
+            chemical templates...
+
+    Those warnings went only to stderr, and the earlier `template_matching_failures`
+    field looked for a different phrase, so a cofactor whose chemistry Meeko
+    constructed itself passed with no visible signal. This promotes it to a
+    field of its own, naming the residues affected.
+
+    **Automatic construction is not geometry-only inference.** Meeko's builder
+    works from a chemical component definition keyed on the residue name and
+    requires the heavy atoms to be complete; its own messages refer to building
+    a template, and a built template reports a SMILES. Whether the definition
+    came from a bundled copy of the Chemical Component Dictionary or was
+    fetched, and what SMILES resulted, is **not** determinable from this output
+    and must be established where Meeko is installed. This function records
+    what the tool said; it does not interpret where the chemistry came from.
+    """
+    not_in_templates: list[str] = []
+    residues: list[str] = []
+    built: list[str] = []
+    failures: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "not in residue_templates" in stripped:
+            not_in_templates.append(stripped)
+            # The residues appear as a dict literal, e.g. {'A:603': 'ANP'}.
+            for chain_residue, name in re.findall(
+                    r"'([^']+)'\s*:\s*'([^']+)'", stripped):
+                residues.append(f"{chain_residue} {name}")
+        if "building chemical templates" in stripped.lower():
+            built.append(stripped)
+        if "New Template Built" in stripped or "template built" in stripped.lower():
+            built.append(stripped)
+        if ("Template generation failed" in stripped
+                or "Failed building template" in stripped):
+            failures.append(stripped)
+    unique_residues = sorted(set(residues))
+    return {
+        "residues_not_in_meeko_templates": unique_residues,
+        "automatic_template_construction_attempted": bool(built),
+        "template_generation_failures": failures,
+        "warning_lines": not_in_templates + built,
+        "chemistry_source": (
+            "unknown from this output" if unique_residues else
+            "all residues matched Meeko's own templates"),
+        "interpretation": (
+            "Meeko built a residue template rather than matching one. That is "
+            "not the same as inferring chemistry from geometry alone, and it "
+            "is also not evidence that the chemistry is right: the definition "
+            "Meeko worked from, and the SMILES it produced, are not reported "
+            "here and must be established where Meeko is installed."
+            if unique_residues else
+            "every residue matched a Meeko template"),
+    }
 
 
 def locate_receptor_pdbqt(prefix: Path) -> Path:
@@ -641,6 +706,7 @@ def prepare(args: argparse.Namespace) -> None:
                 f"{receptor_path}: {prepared_to_receptor.moved_atoms[:10]}"
             )
         check_retained_components(receptor_atoms, args.condition, receptor_path)
+        report_residue_templates(meeko_record["residue_templates"])
     except (PreparationError, provenance.ReceptorError):
         mark_failed(prefix, pdb_path)
         raise
@@ -708,6 +774,34 @@ def prepare(args: argparse.Namespace) -> None:
     print("\nUnresolved decisions recorded in the manifest:")
     for item in unresolved_decisions(args.condition):
         print(f"  - {item}")
+
+
+def report_residue_templates(report: dict[str, object]) -> None:
+    """Print Meeko's template handling conspicuously, not buried in a log.
+
+    A residue whose template Meeko constructed is reported whether or not the
+    run succeeded, because the run succeeding is exactly what makes it easy to
+    miss. The receptor is not blocked: for the ANP-present condition the
+    cofactor is only usable if a template was built, so refusing here would
+    refuse the condition itself. The warning, and the manifest, carry the
+    caveat instead.
+    """
+    residues = report.get("residues_not_in_meeko_templates") or []
+    if not residues:
+        print("residue templates : every residue matched a Meeko template")
+        return
+    print()
+    print("WARNING Meeko had no template for: " + ", ".join(str(r) for r in residues))
+    print("        It built a residue template instead. The run succeeded, so")
+    print("        nothing else will draw attention to this.")
+    print("        Automatic construction is NOT geometry-only inference, and")
+    print("        it is NOT evidence that the chemistry is correct: the")
+    print("        definition Meeko worked from and the SMILES it produced are")
+    print("        not reported in its output. Establish them before relying on")
+    print("        this component's atom types, charges or protonation.")
+    if report.get("template_generation_failures"):
+        print(f"        template generation failures: "
+              f"{report['template_generation_failures']}")
 
 
 def check_retained_components(receptor_atoms, condition: str,

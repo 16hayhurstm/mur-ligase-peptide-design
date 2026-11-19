@@ -510,6 +510,33 @@ def write_manifest(path: Path | str, manifest: dict[str, object],
     return destination
 
 
+def read_manifest_like(path: Path | str,
+                       expected_schema: str | None) -> dict[str, object]:
+    """Read any JSON record written by `write_manifest`, checking its schema.
+
+    `write_manifest` is reused for the receptor manifest, the ligand reference
+    record and the ligand manifest, which share the refuse-to-overwrite
+    behaviour but not their fields. This reader checks only that the file is a
+    JSON object and, when `expected_schema` is given, that its schema matches.
+    Passing None means the caller will check the schema itself.
+    """
+    source = Path(path)
+    try:
+        record = json.loads(source.read_text())
+    except OSError as error:
+        raise ReceptorError(f"cannot read {source}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ReceptorError(f"{source} is not valid JSON: {error}") from error
+    if not isinstance(record, dict):
+        raise ReceptorError(f"{source} does not contain a record object.")
+    if expected_schema is not None and record.get("schema") != expected_schema:
+        raise ReceptorError(
+            f"{source}: expected schema {expected_schema!r}, "
+            f"found {record.get('schema')!r}."
+        )
+    return record
+
+
 def read_manifest(path: Path | str) -> dict[str, object]:
     """Read and validate a receptor manifest written by `write_manifest`."""
     source = Path(path)

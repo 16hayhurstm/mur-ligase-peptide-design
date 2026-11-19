@@ -1,0 +1,502 @@
+"""Assess redocked poses against an immutable reference pose.
+
+usage:
+    python python/analyse_redocking.py DOCK_RUN_DIR LIGAND_NAME \
+        --reference references/uma_chainE.reference.json \
+        --component-dictionary project_private/ccd_downloads/UMA.cif \
+        --out analysis/uma_recovery
+
+What is measured
+----------------
+For every retained pose of every seed: the **symmetry-aware heavy-atom RMSD**
+to the reference, **in the receptor coordinate frame, with no superposition of
+any kind**. A pose is compared where the search put it. Superposing first
+would answer a different question and would hide a pose that has the right
+shape in the wrong place.
+
+The criterion is RMSD <= 2.0 A. Two poses are reported per seed, because they
+answer different questions:
+
+- the **top-ranked** pose, which asks whether the scoring function prefers a
+  near-reference pose;
+- the **closest-to-reference** retained pose with its rank, which asks whether
+  the search reached one at all.
+
+A good closest with a poor top-ranked is a scoring problem. A poor closest is
+a sampling or search-space problem. Collapsing the two loses the distinction
+that makes the control useful, so they are never merged.
+
+**Consistent recovery** means the top-ranked pose meets the criterion in every
+seed. Anything else is a mixed outcome and is reported as such, with the
+continuous RMSD values, never reduced to a pass or fail. Continuous values
+matter: 2.1 A in two seeds out of three is a different situation from 9 A in
+one.
+
+What this cannot establish
+--------------------------
+Recovering the deposited pose shows that this box, this receptor and these
+search settings can place the cognate ligand where the crystal has it. It does
+not establish that peptide poses or peptide rankings are reliable, and it is
+not an affinity measurement. The receptor used for the initial control has
+neither ANP nor manganese, so a recovery is **recovery in the simplified
+receptor, not validation against the native state**.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import box_geometry
+import chemical_component
+import chemical_graph
+import receptor_provenance as provenance
+
+RECOVERY_CRITERION_ANGSTROM = 2.0
+ANALYSIS_SCHEMA = "mur-ligase-redocking-analysis/1"
+
+POSE_FILE_PATTERN = re.compile(r"^seed_(?P<seed>-?\d+)$")
+
+
+@dataclass
+class Pose:
+    """One retained pose from one seed."""
+    seed: int
+    rank: int
+    score: float | None
+    coordinates: dict[str, tuple[float, float, float]]
+    source: str
+
+
+def parse_pose_file(path: Path) -> list[dict[str, object]]:
+    """Read a multi-model ligand PDBQT written by Vina.
+
+    Vina writes one `MODEL`/`ENDMDL` block per retained pose, in rank order,
+    each carrying a `REMARK VINA RESULT` line whose first number is the score
+    in kcal/mol. Models are returned in file order; the rank is the caller's
+    business, since rank 1 is simply the first retained pose.
+    """
+    poses: list[dict[str, object]] = []
+    current: dict[str, tuple[float, float, float]] | None = None
+    score: float | None = None
+    for number, line in enumerate(Path(path).read_text().splitlines(), start=1):
+        if line.startswith("MODEL"):
+            current, score = {}, None
+            continue
+        if line.startswith("REMARK VINA RESULT"):
+            fields = line.split()
+            try:
+                score = float(fields[3])
+            except (IndexError, ValueError):
+                score = None
+            continue
+        if line.startswith(("ATOM", "HETATM")):
+            if current is None:
+                # A single-pose file with no MODEL records.
+                current, score = {}, score
+            name = line[12:16].strip()
+            element_or_type = line[77:80].strip().upper()
+            if element_or_type in ("HD", "H") or name.upper().startswith("H"):
+                continue
+            try:
+                position = (float(line[30:38]), float(line[38:46]),
+                            float(line[46:54]))
+            except ValueError as error:
+                raise chemical_graph.CorrespondenceError(
+                    f"{path} line {number}: malformed coordinate ({error})")
+            if name in current:
+                raise chemical_graph.CorrespondenceError(
+                    f"{path} line {number}: repeated atom name {name} within one pose")
+            current[name] = position
+            continue
+        if line.startswith("ENDMDL"):
+            if current:
+                poses.append({"coordinates": current, "score": score})
+            current, score = None, None
+    if current:
+        poses.append({"coordinates": current, "score": score})
+    if not poses:
+        raise chemical_graph.CorrespondenceError(f"{path} contains no poses")
+    return poses
+
+
+def collect_poses(run_directory: Path, ligand: str) -> list[Pose]:
+    """Gather every retained pose of every seed from a docking run directory.
+
+    Expects the layout `dock.py` writes: `poses/seed_<N>/<ligand>_docked.pdbqt`.
+    """
+    pose_root = run_directory / "poses"
+    if not pose_root.is_dir():
+        raise chemical_graph.CorrespondenceError(
+            f"{pose_root} does not exist; point this at a dock.py output directory")
+    poses: list[Pose] = []
+    seeds_found: list[int] = []
+    for seed_directory in sorted(pose_root.iterdir()):
+        match = POSE_FILE_PATTERN.match(seed_directory.name)
+        if not seed_directory.is_dir() or not match:
+            continue
+        seed = int(match.group("seed"))
+        pose_file = seed_directory / f"{ligand}_docked.pdbqt"
+        if not pose_file.is_file():
+            continue
+        seeds_found.append(seed)
+        for rank, entry in enumerate(parse_pose_file(pose_file), start=1):
+            poses.append(Pose(seed=seed, rank=rank,
+                              score=entry["score"],
+                              coordinates=entry["coordinates"],
+                              source=str(pose_file)))
+    if not poses:
+        raise chemical_graph.CorrespondenceError(
+            f"no poses for ligand {ligand!r} under {pose_root}")
+    return poses
+
+
+def analyse(reference_atoms: dict[str, tuple[float, float, float]],
+            graph: chemical_graph.MolecularGraph,
+            permutations: list[tuple[int, ...]],
+            poses: list[Pose],
+            criterion: float) -> dict[str, object]:
+    """Compute per-pose RMSD and the per-seed and overall summaries."""
+    rows: list[dict[str, object]] = []
+    for pose in poses:
+        rmsd, permutation = chemical_graph.symmetry_aware_rmsd(
+            graph, reference_atoms, pose.coordinates, permutations)
+        identity = tuple(range(len(graph.names)))
+        # The mapping that achieved the minimum is recorded by atom name, not
+        # as a flag: if an independent implementation disagrees on an RMSD,
+        # the two mappings are the first thing to compare.
+        exchanged = " ".join(
+            f"{graph.names[source]}->{graph.names[image]}"
+            for source, image in enumerate(permutation) if source != image)
+        rows.append({
+            "seed": pose.seed,
+            "rank": pose.rank,
+            "score_kcal_per_mol": pose.score,
+            "symmetry_aware_rmsd_angstrom": round(rmsd, 3),
+            "meets_criterion": "yes" if rmsd <= criterion else "no",
+            "permutation_is_identity": permutation == identity,
+            "atoms_exchanged_by_the_minimising_mapping": exchanged,
+            "pose_file": pose.source,
+        })
+
+    per_seed: list[dict[str, object]] = []
+    for seed in sorted({pose.seed for pose in poses}):
+        seed_rows = [row for row in rows if row["seed"] == seed]
+        top = min(seed_rows, key=lambda row: row["rank"])
+        closest = min(seed_rows,
+                      key=lambda row: row["symmetry_aware_rmsd_angstrom"])
+        per_seed.append({
+            "seed": seed,
+            "n_poses_retained": len(seed_rows),
+            "top_ranked": {
+                "rank": top["rank"],
+                "score_kcal_per_mol": top["score_kcal_per_mol"],
+                "rmsd_angstrom": top["symmetry_aware_rmsd_angstrom"],
+                "meets_criterion": top["meets_criterion"],
+            },
+            "closest_to_reference": {
+                "rank": closest["rank"],
+                "score_kcal_per_mol": closest["score_kcal_per_mol"],
+                "rmsd_angstrom": closest["symmetry_aware_rmsd_angstrom"],
+                "meets_criterion": closest["meets_criterion"],
+            },
+        })
+
+    top_values = [entry["top_ranked"]["rmsd_angstrom"] for entry in per_seed]
+    closest_values = [entry["closest_to_reference"]["rmsd_angstrom"]
+                      for entry in per_seed]
+    n_top_pass = sum(1 for entry in per_seed
+                     if entry["top_ranked"]["meets_criterion"] == "yes")
+    consistent = n_top_pass == len(per_seed) and len(per_seed) > 0
+    if consistent:
+        outcome = "consistent recovery"
+    elif n_top_pass:
+        outcome = "mixed outcome"
+    elif any(entry["closest_to_reference"]["meets_criterion"] == "yes"
+             for entry in per_seed):
+        outcome = ("recovery among retained poses, but failure to rank it "
+                   "first in that run")
+    else:
+        outcome = "no recovery"
+
+    return {
+        "criterion_angstrom": criterion,
+        "n_seeds": len(per_seed),
+        "n_poses_total": len(rows),
+        "per_pose": rows,
+        "per_seed": per_seed,
+        "summary": {
+            "outcome": outcome,
+            "consistent_recovery": consistent,
+            "definition": ("consistent recovery means the top-ranked pose meets "
+                           "the criterion in every seed"),
+            "n_seeds_top_ranked_meets_criterion": n_top_pass,
+            "top_ranked_rmsd_range_angstrom": [min(top_values), max(top_values)]
+                                              if top_values else None,
+            "closest_rmsd_range_angstrom": [min(closest_values), max(closest_values)]
+                                           if closest_values else None,
+        },
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("run_directory", type=Path,
+                        help="dock.py output directory")
+    parser.add_argument("ligand", help="Ligand stem, as in the pose filenames")
+    parser.add_argument("--reference", type=Path, required=True,
+                        help="Reference record from ligand_reference.py")
+    parser.add_argument("--component-dictionary", type=Path, required=True,
+                        help="CCD entry supplying connectivity for the symmetry")
+    parser.add_argument("--ligand-manifest", type=Path,
+                        help="Ligand manifest from prepare_ligand.py. It "
+                             "supplies the modelled protonation state, which "
+                             "decides which groups are resonance-equivalent. "
+                             "Without it no equivalence is applied and the "
+                             "RMSD values are upper bounds")
+    parser.add_argument("--out", type=Path, required=True,
+                        help="Output prefix for the analysis record and table")
+    parser.add_argument("--criterion", type=float,
+                        default=RECOVERY_CRITERION_ANGSTROM,
+                        help=f"RMSD criterion in A (default "
+                             f"{RECOVERY_CRITERION_ANGSTROM})")
+    parser.add_argument("--stereo-verification", type=Path,
+                        help="Record of the stereochemistry check against the "
+                             "stereo plan. A prerequisite for interpreting "
+                             "this control")
+    parser.add_argument("--independent-rmsd", type=Path,
+                        help="Record of the independent toolkit RMSD "
+                             "comparison. A prerequisite for interpreting "
+                             "this control")
+    parser.add_argument("--no-resonance-normalisation", action="store_true",
+                        help="Treat terminal oxygens as distinguishable; "
+                             "reported in the record and not recommended")
+    args = parser.parse_args()
+
+    try:
+        run(args)
+    except (chemical_graph.CorrespondenceError, chemical_component.ComponentError,
+            provenance.ReceptorError, box_geometry.BoxError) as error:
+        sys.exit(f"error: {error}")
+
+
+def run(args: argparse.Namespace) -> None:
+    if args.criterion <= 0:
+        raise chemical_graph.CorrespondenceError(
+            f"the criterion must be positive, got {args.criterion}")
+    reference_record = provenance.read_manifest_like(args.reference, None)
+    if reference_record.get("schema") != "mur-ligase-ligand-reference/1":
+        raise chemical_graph.CorrespondenceError(
+            f"{args.reference} is not a ligand reference record")
+    reference_atoms = {
+        name: tuple(entry["coordinates_angstrom"])
+        for name, entry in reference_record["atom_mapping"].items()
+    }
+    component = chemical_component.read_component(args.component_dictionary)
+    if component.identifier != reference_record["component"]:
+        raise chemical_graph.CorrespondenceError(
+            f"the dictionary is for {component.identifier} but the reference "
+            f"is for {reference_record['component']}")
+
+    # The symmetry that applies depends on the modelled protonation state, so
+    # it is taken from the ligand manifest rather than assumed. Without one,
+    # no group is treated as resonance-equivalent: an unjustified equivalence
+    # is the error that matters, and the consequence of omitting a justified
+    # one is a conservatively larger RMSD.
+    still_protonated: list[str] | None = None
+    protonation_basis = ("no ligand manifest supplied; no resonance "
+                         "equivalence applied, so reported RMSD values are "
+                         "upper bounds")
+    if args.ligand_manifest:
+        ligand_manifest = provenance.read_manifest_like(
+            args.ligand_manifest, "mur-ligase-ligand/1")
+        if ligand_manifest["component"] != component.identifier:
+            raise chemical_graph.CorrespondenceError(
+                f"the ligand manifest is for {ligand_manifest['component']} "
+                f"but the dictionary is for {component.identifier}")
+        deprotonated = set(
+            ligand_manifest["protonation_state"]["deprotonated_atoms"])
+        still_protonated = sorted(set(component.hydrogens_on) - deprotonated)
+        protonation_basis = (
+            f"modelled state from {args.ligand_manifest}: pH "
+            f"{ligand_manifest['protonation_state']['modelled_ph']}, "
+            f"formal charge "
+            f"{ligand_manifest['protonation_state']['modelled_formal_charge']}, "
+            f"deprotonated {sorted(deprotonated)}")
+    if args.no_resonance_normalisation:
+        still_protonated = None
+        protonation_basis += "; resonance normalisation disabled by request"
+    graph, resonance = chemical_graph.normalise_resonance(
+        component.graph, hydrogen_bearing=still_protonated)
+    permutations = chemical_graph.automorphisms(graph)
+
+    poses = collect_poses(args.run_directory, args.ligand)
+    analysis = analyse(reference_atoms, graph, permutations, poses,
+                       args.criterion)
+
+    run_record_path = args.run_directory / "run_record.json"
+    docking_context: dict[str, object] = {}
+    if run_record_path.is_file():
+        run_record = json.loads(run_record_path.read_text())
+        docking_context = {
+            "box_centre_angstrom": run_record.get("box_centre_angstrom"),
+            "box_size_angstrom": run_record.get("box_size_angstrom"),
+            "seeds_requested": run_record.get("seeds"),
+            "exhaustiveness": run_record.get("exhaustiveness"),
+            "receptor": run_record.get("receptor"),
+            "receptor_condition": run_record.get("receptor_condition"),
+            "receptor_provenance_verified": run_record.get(
+                "receptor_provenance_verified"),
+        }
+
+    prerequisites = {
+        "stereochemistry_verified": {
+            "satisfied": bool(args.stereo_verification),
+            "evidence": (None if not args.stereo_verification
+                         else str(Path(args.stereo_verification).resolve())),
+            "requirement": ("every must_match stereocentre in the plan from "
+                            "`prepare_ligand.py stereo-plan` compared against "
+                            "CIP codes assigned from the prepared 3D "
+                            "coordinates"),
+        },
+        "independent_rmsd_comparison": {
+            "satisfied": bool(args.independent_rmsd),
+            "evidence": (None if not args.independent_rmsd
+                         else str(Path(args.independent_rmsd).resolve())),
+            "requirement": ("this project's symmetry-aware RMSD compared "
+                            "against an established toolkit on the same "
+                            "structures, using the same protonation state and "
+                            "the same chemically allowed atom equivalences"),
+        },
+    }
+    interpretable = all(entry["satisfied"] for entry in prerequisites.values())
+
+    record = {
+        "schema": ANALYSIS_SCHEMA,
+        "ligand": args.ligand,
+        "component": component.identifier,
+        "prerequisites": prerequisites,
+        "interpretable": interpretable,
+        "interpretability_note": (
+            "the numbers below are computed regardless, but the control must "
+            "not be interpreted until both prerequisites are satisfied: an "
+            "unverified stereoisomer or an unvalidated RMSD implementation "
+            "would make a pass or a failure equally uninformative"),
+        "reference": {
+            "path": str(args.reference),
+            "sha256": box_geometry.file_sha256(args.reference),
+            "source_structure": reference_record["source_structure"],
+            "selection": reference_record["selection"],
+        },
+        "measure": {
+            "name": "symmetry-aware heavy-atom RMSD",
+            "superposition": "none; computed in the receptor coordinate frame",
+            "hydrogens": "excluded",
+            "resonance_normalisation": resonance,
+            "resonance_normalisation_applied": not args.no_resonance_normalisation,
+            "protonation_basis": protonation_basis,
+            "stereochemistry": (
+                "not verified by this measure; the RMSD assumes both "
+                "structures are the same stereoisomer. CIP codes assigned "
+                "from 3D coordinates must be compared at the preparation "
+                "stage"),
+            "independent_validation": (
+                "this is a custom implementation whose tests are not "
+                "independent of it; compare against an established toolkit "
+                "before relying on the values (see docs/uma_control.md)"),
+            "n_automorphisms": len(permutations),
+            "orbits": chemical_graph.symmetry_classes(graph, permutations),
+        },
+        "docking_context": docking_context,
+        "analysis": analysis,
+        "interpretation_limits": [
+            "recovery of the deposited pose tests the box, receptor and search "
+            "settings; it does not establish that peptide poses or rankings "
+            "are reliable",
+            "a docking score is not a measured affinity, and these scores are "
+            "not thresholds for peptides",
+            "the initial control receptor has neither ANP nor manganese, so "
+            "this is recovery in the simplified receptor, not validation "
+            "against the native state",
+            "the reference is one crystallographic conformer, and the pocket "
+            "side chains are those adopted with this ligand bound",
+        ],
+    }
+
+    record_path = args.out.with_name(args.out.name + ".analysis.json")
+    table_path = args.out.with_name(args.out.name + "_per_pose.csv")
+    provenance.write_manifest(record_path, record)
+    with table_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(analysis["per_pose"][0]))
+        writer.writeheader()
+        writer.writerows(analysis["per_pose"])
+
+    print(f"ligand           : {args.ligand} ({component.identifier})")
+    print(f"reference        : {args.reference}")
+    print(f"measure          : symmetry-aware heavy-atom RMSD, no superposition,"
+          f" {len(permutations)} automorphisms")
+    print(f"criterion        : RMSD <= {args.criterion} A")
+    if docking_context:
+        print(f"box              : size {docking_context.get('box_size_angstrom')} A,"
+              f" receptor condition {docking_context.get('receptor_condition')!r}")
+    print()
+    header = (f"{'seed':>6}{'poses':>7}{'top rank':>10}{'top score':>11}"
+              f"{'top RMSD':>10}{'crit':>6}{'closest rank':>14}"
+              f"{'closest score':>15}{'closest RMSD':>14}{'crit':>6}")
+    print(header)
+    print("-" * len(header))
+    for entry in analysis["per_seed"]:
+        top, closest = entry["top_ranked"], entry["closest_to_reference"]
+        print(f"{entry['seed']:>6}{entry['n_poses_retained']:>7}"
+              f"{top['rank']:>10}"
+              f"{_score(top['score_kcal_per_mol']):>11}"
+              f"{top['rmsd_angstrom']:>10.3f}{top['meets_criterion']:>6}"
+              f"{closest['rank']:>14}"
+              f"{_score(closest['score_kcal_per_mol']):>15}"
+              f"{closest['rmsd_angstrom']:>14.3f}"
+              f"{closest['meets_criterion']:>6}")
+    print("-" * len(header))
+    summary = analysis["summary"]
+    print(f"\noutcome          : {summary['outcome'].upper()}")
+    print(f"  top-ranked meets the criterion in "
+          f"{summary['n_seeds_top_ranked_meets_criterion']} of "
+          f"{analysis['n_seeds']} seeds")
+    print(f"  top-ranked RMSD range   : {summary['top_ranked_rmsd_range_angstrom']} A")
+    print(f"  closest-pose RMSD range : {summary['closest_rmsd_range_angstrom']} A")
+    print(f"\nwrote            : {record_path}")
+    print(f"                   {table_path}")
+    print()
+    if interpretable:
+        print("prerequisites    : stereochemistry verified and RMSD "
+              "independently compared;")
+        print("                   both recorded in the analysis record.")
+    else:
+        outstanding = [name for name, entry in prerequisites.items()
+                       if not entry["satisfied"]]
+        print("=" * 70)
+        print("DO NOT INTERPRET THIS CONTROL YET. Outstanding prerequisites:")
+        for name in outstanding:
+            print(f"  - {name}: {prerequisites[name]['requirement']}")
+        print("The RMSD values above are computed, but an unverified")
+        print("stereoisomer or an unvalidated RMSD implementation makes a")
+        print("pass and a failure equally uninformative. Supply")
+        print("--stereo-verification and --independent-rmsd once done.")
+        print("=" * 70)
+    print("\nRecovery here is recovery in the simplified receptor (no ANP, no "
+          "manganese).\nIt is not validation against the native state, and it "
+          "says nothing about\npeptide affinity.")
+
+
+def _score(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+if __name__ == "__main__":
+    main()
