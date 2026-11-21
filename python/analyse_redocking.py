@@ -279,6 +279,7 @@ def validated_stereo_verification(path: Path | None,
     requirement = ("a verification record from verify_ligand_rdkit.py whose "
                    "result is 'passed', with no fatal stereochemistry "
                    "mismatch, for the same ligand manifest being analysed")
+    manifest_identity: dict[str, object] | None = None
     if path is None:
         return {"satisfied": False, "evidence": None, "requirement": requirement,
                 "reason": "no record supplied"}
@@ -307,12 +308,19 @@ def validated_stereo_verification(path: Path | None,
     else:
         recorded = (record.get("inputs", {}) or {}).get("ligand_manifest_sha256")
         actual = box_geometry.file_sha256(ligand_manifest)
+        # A manifest modified in place by a historical check stage is still the
+        # manifest that was verified, provided restoring that one known block
+        # reproduces the recorded digest exactly. The basis is carried through
+        # to the analysis record so a compatibility match is visible as one.
+        agreement = provenance.manifest_hash_agreement(ligand_manifest, recorded)
+        manifest_identity = agreement
         if not recorded:
             problems.append("the record carries no ligand manifest hash")
-        elif recorded != actual:
+        elif not agreement["agrees"]:
             problems.append(
                 f"the record verifies a different ligand manifest "
-                f"(recorded {recorded[:12]}..., analysing {actual[:12]}...)")
+                f"(recorded {recorded[:12]}..., analysing {actual[:12]}...): "
+                f"{agreement['reason']}")
 
     investigation = ((record.get("checks", {}) or {})
                      .get("stereochemistry_before_hydrogens", {}) or {}).get(
@@ -324,12 +332,110 @@ def validated_stereo_verification(path: Path | None,
         "reason": "; ".join(problems) if problems else "record validated",
         "record_result": record.get("result"),
         "record_state": record.get("state"),
+        "ligand_manifest_identity": manifest_identity,
         "rdkit_version": (record.get("tools", {}) or {}).get("rdkit"),
         "centres_requiring_investigation": investigation,
         "note": ("centres requiring investigation do not block the "
                  "prerequisite when none is fatal, but they are carried here "
                  "so they are not lost"
                  if investigation else None),
+    }
+
+
+INDEPENDENT_RMSD_SCHEMA = "mur-ligase-independent-rmsd/1"
+
+
+def validated_independent_rmsd(path: Path | None,
+                               ligand_manifest: Path | None
+                               ) -> dict[str, object]:
+    """Check an independent RMSD comparison record, rather than its existence.
+
+    The prerequisite is that this project's symmetry-aware RMSD has been
+    compared against an established toolkit, on the same structures, at the
+    same protonation state and under the same chemically allowed atom
+    equivalences. A file being present evidences none of that, so the record
+    must state a passing result, describe **the ligand manifest being
+    analysed** matched by SHA-256, report every case as agreeing within its
+    stated tolerance, carry the negative case that would expose a wrongly
+    permitted oxygen exchange, and attest that no coordinate fitting was
+    applied. A record whose own checks failed, or which compared a different
+    ligand or protonation state, does not satisfy the prerequisite.
+    """
+    requirement = ("this project's symmetry-aware RMSD compared against an "
+                   "established toolkit on the same structures, using the "
+                   "same protonation state and the same chemically allowed "
+                   "atom equivalences, with no coordinate fitting")
+    if path is None:
+        return {"satisfied": False, "evidence": None, "requirement": requirement,
+                "reason": "no record supplied"}
+    try:
+        record = provenance.read_manifest_like(path, INDEPENDENT_RMSD_SCHEMA)
+    except provenance.ReceptorError as error:
+        return {"satisfied": False, "evidence": str(path),
+                "requirement": requirement,
+                "reason": f"not a usable comparison record: {error}"}
+
+    problems: list[str] = []
+    if record.get("result") != "passed":
+        problems.append(
+            f"the record's result is {record.get('result')!r}, not 'passed'"
+            + (f": {record.get('failure_reasons')}"
+               if record.get("failure_reasons") else ""))
+
+    checks = record.get("checks", {}) or {}
+    if not checks.get("all_cases_agree"):
+        problems.append(
+            f"the record does not report agreement on every case "
+            f"(maximum absolute difference "
+            f"{checks.get('max_absolute_difference_angstrom')} A against a "
+            f"tolerance of {record.get('tolerance_angstrom')} A)")
+    if not checks.get("negative_case_distinguished"):
+        problems.append(
+            "the record does not report the negative case as distinguished, "
+            "so a wrongly permitted oxygen exchange would not have been caught")
+    if not checks.get("equivalences_independently_verified"):
+        problems.append(
+            "the record does not report the toolkit's own atom equivalences "
+            "as verified against this project's, so the comparison may have "
+            "been made under this project's assumptions on both sides")
+    if (record.get("measure", {}) or {}).get("superposition") != "none":
+        problems.append(
+            f"the record's superposition is "
+            f"{(record.get('measure', {}) or {}).get('superposition')!r}, not "
+            f"'none'; a fitted RMSD is a different quantity")
+
+    manifest_identity: dict[str, object] | None = None
+    if ligand_manifest is None:
+        problems.append("no --ligand-manifest given, so the record cannot be "
+                        "tied to the ligand being analysed")
+    else:
+        recorded = (record.get("inputs", {}) or {}).get("ligand_manifest_sha256")
+        manifest_identity = provenance.manifest_hash_agreement(ligand_manifest,
+                                                               recorded)
+        if not recorded:
+            problems.append("the record carries no ligand manifest hash")
+        elif not manifest_identity["agrees"]:
+            problems.append(
+                f"the record compared a different ligand manifest: "
+                f"{manifest_identity['reason']}")
+
+    return {
+        "satisfied": not problems,
+        "evidence": str(Path(path).resolve()),
+        "requirement": requirement,
+        "reason": "; ".join(problems) if problems else "record validated",
+        "record_result": record.get("result"),
+        "record_state": record.get("state"),
+        "content_class": record.get("content_class"),
+        "ligand_manifest_identity": manifest_identity,
+        "max_absolute_difference_angstrom": checks.get(
+            "max_absolute_difference_angstrom"),
+        "tolerance_angstrom": record.get("tolerance_angstrom"),
+        "n_cases": len(record.get("cases", []) or []),
+        "toolkit": (record.get("tools", {}) or {}).get("rdkit"),
+        "note": ("the cases are synthetic coordinate transformations, which "
+                 "validate the RMSD implementation and not any docking "
+                 "result"),
     }
 
 
@@ -538,15 +644,8 @@ def run(args: argparse.Namespace) -> None:
         args.stereo_verification, args.ligand_manifest)
     prerequisites = {
         "stereochemistry_verified": stereo_status,
-        "independent_rmsd_comparison": {
-            "satisfied": bool(args.independent_rmsd),
-            "evidence": (None if not args.independent_rmsd
-                         else str(Path(args.independent_rmsd).resolve())),
-            "requirement": ("this project's symmetry-aware RMSD compared "
-                            "against an established toolkit on the same "
-                            "structures, using the same protonation state and "
-                            "the same chemically allowed atom equivalences"),
-        },
+        "independent_rmsd_comparison": validated_independent_rmsd(
+            args.independent_rmsd, args.ligand_manifest),
     }
     interpretable = all(entry["satisfied"] for entry in prerequisites.values())
 

@@ -766,6 +766,7 @@ class DictionaryAndReferenceTests(unittest.TestCase):
         pdbqt.write_text(self.pdbqt_text(moved, charge_total=-1.0))
         finished = self.run_script(
             PREPARE_LIGAND, "check", self.root / "built.ligand.json", pdbqt,
+            "--out", self.root / "prep.json", "--overwrite",
             success=False)
         self.assertIn("must not move the heavy atoms", finished.stderr)
 
@@ -785,6 +786,7 @@ class DictionaryAndReferenceTests(unittest.TestCase):
         pdbqt.write_text(self.pdbqt_text(reference, charge_total=0.0))
         finished = self.run_script(
             PREPARE_LIGAND, "check", self.root / "built.ligand.json", pdbqt,
+            "--out", self.root / "prep.json", "--overwrite",
             success=False)
         self.assertIn("did not apply the protonation state", finished.stderr)
 
@@ -805,10 +807,14 @@ class DictionaryAndReferenceTests(unittest.TestCase):
                                          torsdof=3, branches=2,
                                          hydrogen=True))
         self.run_script(PREPARE_LIGAND, "check", self.root / "built.ligand.json",
-                        pdbqt, "--charge-model", "gasteiger",
+                        pdbqt, "--out", self.root / "built.preparation.json",
+                        "--charge-model", "gasteiger",
                         "--preparation-command", "mk_prepare_ligand.py -i x.sdf")
-        manifest = json.loads((self.root / "built.ligand.json").read_text())
-        preparation = manifest["preparation"]
+        record = json.loads(
+            (self.root / "built.preparation.json").read_text())
+        self.assertEqual(record["schema"], "mur-ligase-ligand-preparation/1")
+        self.assertEqual(record["result"], "passed")
+        preparation = record["preparation"]
         self.assertTrue(preparation["performed"])
         self.assertEqual(preparation["torsdof"], 3)
         self.assertEqual(preparation["n_branch_records"], 2)
@@ -845,6 +851,7 @@ class DictionaryAndReferenceTests(unittest.TestCase):
         pdbqt.write_text("\n".join(text) + "\n")
         finished = self.run_script(
             PREPARE_LIGAND, "check", self.root / "built.ligand.json", pdbqt,
+            "--out", self.root / "prep.json", "--overwrite",
             success=False)
         self.assertIn("repeats atom names", finished.stderr)
         self.assertIn("O1", finished.stderr)
@@ -880,6 +887,7 @@ class DictionaryAndReferenceTests(unittest.TestCase):
         pdbqt.write_text(self.pdbqt_text(partial, charge_total=-1.0))
         finished = self.run_script(
             PREPARE_LIGAND, "check", self.root / "built.ligand.json", pdbqt,
+            "--out", self.root / "prep.json", "--overwrite",
             success=False)
         self.assertIn("not made over a subset", finished.stderr)
 

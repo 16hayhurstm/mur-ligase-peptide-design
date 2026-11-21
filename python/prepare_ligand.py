@@ -11,9 +11,11 @@ Two stages, because they need different things installed:
         --protonation-justification "..."
 
     # Stage 2, needs the prepared PDBQT from Meeko: verify it against the
-    # reference and record what the preparation actually produced.
+    # reference and record what the preparation actually produced. The
+    # evidence goes to its own record; the ligand manifest is not modified.
     python python/prepare_ligand.py check \
-        ligands/uma.ligand.json ligands/uma.pdbqt
+        ligands/uma.ligand.json ligands/uma.pdbqt \
+        --out ligands/uma.preparation.json
 
 Why a molfile rather than a PDB
 -------------------------------
@@ -63,6 +65,7 @@ import chemical_graph
 import receptor_provenance as provenance
 
 LIGAND_SCHEMA = "mur-ligase-ligand/1"
+PREPARATION_SCHEMA = "mur-ligase-ligand-preparation/1"
 
 # V2000 bond-order codes for the CCD's value_order strings.
 BOND_ORDER_CODES = {"SING": 1, "DOUB": 2, "TRIP": 3, "AROM": 4,
@@ -243,7 +246,14 @@ def build(args: argparse.Namespace) -> None:
             "n_atoms_written": len(component.heavy_atom_names),
             "hydrogens_written": 0,
         },
-        "preparation": {"performed": False},
+        # This manifest never records the preparation. The check stage writes a
+        # separate `mur-ligase-ligand-preparation/1` record, so that this
+        # file's SHA-256 stays the ligand's identity for the verification, the
+        # atom map and the analysis.
+        "preparation": {"performed": False,
+                        "recorded_separately": (
+                            "prepare_ligand.py check --out writes a "
+                            "mur-ligase-ligand-preparation/1 record")},
         "unresolved": [
             "hydrogen positions, partial charges and atom types are not set "
             "here; they come from the preparation tool and are recorded by the "
@@ -387,7 +397,15 @@ def _atoms_by_atom_map(atom_map_path: Path, pdbqt_path: Path):
 
 
 def check(args: argparse.Namespace) -> None:
-    """Stage 2: verify the prepared PDBQT and record what it contains."""
+    """Stage 2: verify the prepared PDBQT and record what it contains.
+
+    Writes a `mur-ligase-ligand-preparation/1` record and leaves the ligand
+    manifest untouched. An earlier version wrote the evidence back into the
+    manifest, which changed the manifest's SHA-256 after the stereochemistry
+    verification and the atom map had already recorded that digest as the
+    ligand's identity; both gates then rejected the manifest. The record is
+    tied to the prepared PDBQT and the manifest by digest instead.
+    """
     manifest = provenance.read_manifest_like(args.ligand_manifest,
                                              expected_schema=LIGAND_SCHEMA)
     reference_atoms = {
@@ -441,6 +459,7 @@ def check(args: argparse.Namespace) -> None:
             worst, worst_atom = deviation, name
     preserved = worst <= tolerance
 
+    prepared_pdbqt_sha256 = box_geometry.file_sha256(args.prepared_pdbqt)
     charge_sum = sum(float(entry["charge"]) for entry in atoms.values())
     expected_charge = manifest["protonation_state"]["modelled_formal_charge"]
     types: dict[str, int] = {}
@@ -448,11 +467,16 @@ def check(args: argparse.Namespace) -> None:
         key = str(entry["element_or_type"])
         types[key] = types.get(key, 0) + 1
 
-    manifest["preparation"] = {
+    # The preparation evidence is written to its own record rather than back
+    # into the ligand manifest. Rewriting the manifest changed its SHA-256,
+    # which is the identity the stereochemistry verification and the atom map
+    # record; every downstream gate keyed to that digest then failed for a
+    # bookkeeping reason rather than a scientific one.
+    preparation = {
         "performed": True,
         "checked_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "prepared_pdbqt": str(args.prepared_pdbqt),
-        "prepared_pdbqt_sha256": box_geometry.file_sha256(args.prepared_pdbqt),
+        "prepared_pdbqt_sha256": prepared_pdbqt_sha256,
         "n_atoms_total": len(atoms),
         "n_heavy_atoms": len(heavy_present),
         "n_hydrogens": len(hydrogens),
@@ -480,7 +504,47 @@ def check(args: argparse.Namespace) -> None:
             "stereochemistry re-derivation from the prepared coordinates",
         ],
     }
-    provenance.write_manifest(args.ligand_manifest, manifest, overwrite=True)
+
+    # The record is tied to the exact prepared PDBQT it describes and to the
+    # manifest it was checked against, both by digest. The manifest itself is
+    # not touched, so the digest recorded here is the one verification saw.
+    # A failed check still writes its record: the diagnostic detail is the
+    # evidence of what the preparation produced. `result` is what downstream
+    # readers gate on, so a failed record cannot be mistaken for a passed one.
+    failures = []
+    if not preserved:
+        failures.append(
+            f"heavy atoms deviate from the reference by {worst:.4f} A at "
+            f"{worst_atom}, beyond the {tolerance} A tolerance")
+    if not preparation["charge_sum_matches_formal_charge"]:
+        failures.append(
+            f"partial charges sum to {charge_sum:+.4f} against a recorded "
+            f"formal charge of {expected_charge:+d}")
+
+    record = {
+        "schema": PREPARATION_SCHEMA,
+        "result": "failed" if failures else "passed",
+        "failure_reasons": failures,
+        "component": manifest["component"],
+        "inputs": {
+            "ligand_manifest": str(args.ligand_manifest),
+            "ligand_manifest_sha256": box_geometry.file_sha256(
+                args.ligand_manifest),
+            "prepared_pdbqt": str(args.prepared_pdbqt),
+            "prepared_pdbqt_sha256": prepared_pdbqt_sha256,
+            "reference_record": manifest["reference"]["path"],
+            "atom_map_record": correspondence.get("atom_map_record"),
+            "atom_map_record_sha256": correspondence.get(
+                "atom_map_record_sha256"),
+        },
+        "protonation_state": manifest["protonation_state"],
+        "preparation": preparation,
+        "note": ("the ligand manifest is deliberately left unmodified: its "
+                 "SHA-256 is the identity the stereochemistry verification "
+                 "and the atom map were recorded against"),
+    }
+    destination = Path(args.out)
+    provenance.write_manifest(destination, record, overwrite=args.overwrite)
 
     print(f"prepared ligand  : {args.prepared_pdbqt}")
     print(f"  atoms          : {len(atoms)} total, {len(heavy_present)} heavy, "
@@ -492,7 +556,8 @@ def check(args: argparse.Namespace) -> None:
           f"{torsions['n_branch_records']} BRANCH records")
     print(f"  max deviation  : {worst:.4f} A from the reference "
           f"(tolerance {tolerance} A) at {worst_atom}")
-    print(f"manifest updated : {args.ligand_manifest}")
+    print(f"wrote            : {destination}")
+    print(f"manifest          : {args.ligand_manifest} left unmodified")
 
     if not preserved:
         raise LigandError(
@@ -501,7 +566,7 @@ def check(args: argparse.Namespace) -> None:
             f"tolerance. Preparation must not move the heavy atoms; a moved "
             f"ligand cannot be compared with the reference pose."
         )
-    if not manifest["preparation"]["charge_sum_matches_formal_charge"]:
+    if not preparation["charge_sum_matches_formal_charge"]:
         raise LigandError(
             f"the partial charges sum to {charge_sum:+.4f} but the recorded "
             f"protonation state implies {expected_charge:+d}. The preparation "
@@ -706,11 +771,16 @@ def atom_map(args: argparse.Namespace) -> None:
     recorded_manifest = (verification.get("inputs", {}) or {}).get(
         "ligand_manifest_sha256")
     actual_manifest = box_geometry.file_sha256(args.ligand_manifest)
-    if recorded_manifest and recorded_manifest != actual_manifest:
+    agreement = provenance.manifest_hash_agreement(args.ligand_manifest,
+                                                   recorded_manifest)
+    if recorded_manifest and not agreement["agrees"]:
         raise LigandError(
             f"{args.verification_record} verified a different ligand manifest "
             f"(recorded {recorded_manifest[:12]}..., given "
-            f"{actual_manifest[:12]}...)")
+            f"{actual_manifest[:12]}...): {agreement['reason']}")
+    if agreement["legacy_compatibility_used"]:
+        print(f"note: {args.ligand_manifest} was modified in place by an "
+              f"earlier check stage; {agreement['basis']}")
 
     # The input Meeko was given is the hydrogenated molfile the verification
     # wrote. Its hash is checked, and its heavy atoms are then validated
@@ -746,6 +816,7 @@ def atom_map(args: argparse.Namespace) -> None:
     record["provenance"] = {
         "ligand_manifest": str(args.ligand_manifest),
         "ligand_manifest_sha256": actual_manifest,
+        "ligand_manifest_identity": agreement,
         "verification_record": str(args.verification_record),
         "verification_record_sha256": box_geometry.file_sha256(
             args.verification_record),
@@ -805,6 +876,12 @@ def main() -> None:
     checker = subparsers.add_parser("check", help="Verify a prepared PDBQT")
     checker.add_argument("ligand_manifest", type=Path)
     checker.add_argument("prepared_pdbqt", type=Path)
+    checker.add_argument("--out", type=Path, required=True,
+                         help="Preparation record to write. The ligand "
+                              "manifest is left unmodified, because its "
+                              "SHA-256 is the identity the verification and "
+                              "the atom map were recorded against")
+    checker.add_argument("--overwrite", action="store_true")
     checker.add_argument("--coordinate-tolerance", type=float,
                          default=provenance.COORDINATE_TOLERANCE_ANGSTROM)
     checker.add_argument("--charge-model", default="unrecorded",

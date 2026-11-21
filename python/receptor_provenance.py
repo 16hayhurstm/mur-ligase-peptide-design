@@ -42,6 +42,7 @@ Limitations
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -535,6 +536,139 @@ def read_manifest_like(path: Path | str,
             f"found {record.get('schema')!r}."
         )
     return record
+
+
+# ---------------------------------------------------------------------------
+# Manifest identity across the preparation stages
+# ---------------------------------------------------------------------------
+
+# The single top-level key that `prepare_ligand.py check` wrote into the ligand
+# manifest before the preparation evidence was moved into its own record. Only
+# this key is ever restored, and only to one of the shapes below.
+LEGACY_PREPARATION_KEY = "preparation"
+
+# The shapes the key held before `check` overwrote it. `None` means the key was
+# absent altogether. These are the only candidates: a restoration is accepted
+# solely when it reproduces the recorded digest exactly, so this list cannot be
+# widened into "any subset of manifest fields that happens to match".
+_LEGACY_PREPARATION_SHAPES: tuple[tuple[str, object | None], ...] = (
+    ("the build-stage sentinel {'performed': False}", {"performed": False}),
+    ("the key absent altogether", None),
+)
+
+
+def _manifest_digest(manifest: dict[str, object]) -> str:
+    """Hash a manifest exactly as `write_manifest` would serialise it.
+
+    The digest must be taken over the bytes the original writer produces, not
+    over some other canonical form, or a legacy manifest could never reproduce
+    the hash its verification recorded. `write_manifest` is the single writer,
+    so its serialisation is reproduced here verbatim.
+    """
+    text = json.dumps(manifest, indent=2) + "\n"
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def manifest_hash_agreement(manifest_path: Path | str,
+                            recorded_sha256: str | None) -> dict[str, object]:
+    """Decide whether a manifest is the one a downstream record was built on.
+
+    A record such as a stereochemistry verification names the ligand manifest
+    it describes by SHA-256. The manifest as it stands is compared first. If it
+    does not match, and it carries the single legacy top-level `preparation`
+    block that `prepare_ligand.py check` used to write in place, the block is
+    restored to each shape it held before that stage and the digest recomputed.
+    Agreement is **exact digest equality** in every case; nothing is accepted
+    on the strength of a field-by-field comparison, and no historical hash is
+    rewritten.
+
+    Returns the verdict, the basis on which it was reached, both digests, and
+    `legacy_compatibility_used`, so a record built through the compatibility
+    path says so rather than looking like an unmodified match. Agreement means
+    the manifest's *scientific content* is the content that was verified: the
+    component, the protonation state, the reference and the dictionary are all
+    outside the restored block, so a change to any of them cannot match.
+    """
+    source = Path(manifest_path)
+    actual = None
+    try:
+        actual = file_digest_of(source)
+    except OSError as error:
+        return {
+            "agrees": False,
+            "basis": "the manifest could not be read",
+            "recorded_sha256": recorded_sha256,
+            "actual_sha256": None,
+            "legacy_compatibility_used": False,
+            "reason": f"cannot read {source}: {error}",
+        }
+
+    verdict: dict[str, object] = {
+        "agrees": False,
+        "basis": None,
+        "recorded_sha256": recorded_sha256,
+        "actual_sha256": actual,
+        "legacy_compatibility_used": False,
+        "reason": None,
+    }
+    if not recorded_sha256:
+        verdict["reason"] = "the record carries no ligand manifest hash"
+        return verdict
+    if recorded_sha256 == actual:
+        verdict.update(agrees=True, basis="the manifest as it stands",
+                       reason="digests match without any restoration")
+        return verdict
+
+    try:
+        manifest = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        verdict["reason"] = f"{source} is not readable JSON: {error}"
+        return verdict
+    if not isinstance(manifest, dict) or LEGACY_PREPARATION_KEY not in manifest:
+        verdict["reason"] = (
+            f"the digests differ and {source} carries no top-level "
+            f"{LEGACY_PREPARATION_KEY!r} block, so there is no legacy "
+            f"preparation stage to account for; this is a different manifest")
+        return verdict
+
+    for description, shape in _LEGACY_PREPARATION_SHAPES:
+        candidate = dict(manifest)
+        if shape is None:
+            candidate.pop(LEGACY_PREPARATION_KEY)
+        else:
+            candidate[LEGACY_PREPARATION_KEY] = shape
+        if _manifest_digest(candidate) == recorded_sha256:
+            verdict.update(
+                agrees=True,
+                legacy_compatibility_used=True,
+                basis=(f"legacy compatibility: the top-level "
+                       f"{LEGACY_PREPARATION_KEY!r} block was restored to "
+                       f"{description}, which reproduces the recorded digest "
+                       f"exactly"),
+                reason=("this manifest was modified in place by an earlier "
+                        "prepare_ligand.py check; its verified content is "
+                        "unchanged"),
+            )
+            return verdict
+
+    verdict["reason"] = (
+        f"the digests differ and no restoration of the top-level "
+        f"{LEGACY_PREPARATION_KEY!r} block reproduces the recorded digest, so "
+        f"the manifest's verified content has itself changed")
+    return verdict
+
+
+def file_digest_of(path: Path | str) -> str:
+    """SHA-256 of a file, matching `box_geometry.file_sha256`.
+
+    Duplicated here only to keep this module importable without the box
+    geometry module, which pulls in NumPy.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def read_manifest(path: Path | str) -> dict[str, object]:

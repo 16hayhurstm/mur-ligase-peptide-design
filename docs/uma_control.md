@@ -625,10 +625,45 @@ record, and must not be reused across a re-preparation.
 ```bash
 python python/prepare_ligand.py check \
     ligands/uma.ligand.json ligands/uma_minus3_try1.pdbqt \
+    --out ligands/uma_minus3.preparation.json \
     --atom-map ligands/uma.atom_map.json \
     --charge-model gasteiger \
-    --preparation-command "mk_prepare_ligand.py -i ligands/uma_verified_withH.mol -o ligands/uma.pdbqt"
+    --preparation-command "mk_prepare_ligand.py -i ligands/uma_verified_v2_withH.mol -o ligands/uma_minus3_try1.pdbqt --charge_model gasteiger --add_index_map"
+
+python python/prepare_ligand.py check \
+    ligands/uma_minus2.ligand.json ligands/uma_minus2_try1.pdbqt \
+    --out ligands/uma_minus2.preparation.json \
+    --atom-map ligands/uma_minus2.atom_map.json \
+    --charge-model gasteiger \
+    --preparation-command "mk_prepare_ligand.py -i ligands/uma_minus2_verified_withH.mol -o ligands/uma_minus2_try1.pdbqt --charge_model gasteiger --add_index_map"
 ```
+
+`--preparation-command` is recorded verbatim, so it must be the **exact**
+command that produced the PDBQT being checked, with its original `-i` and `-o`
+arguments. An abbreviated command is incomplete provenance: it does not
+identify which input molfile was converted or which output was written, and
+the record is then not reproducible. Substitute the real −2 filenames if they
+differ from those above.
+
+`--out` is required and the ligand manifest is **left unmodified**. An earlier
+version wrote the preparation results back into the manifest, which changed the
+manifest's SHA-256 after the stereochemistry verification and the atom map had
+already recorded that digest as the ligand's identity; every downstream gate
+keyed to it then failed for a bookkeeping reason rather than a scientific one.
+The evidence now lives in its own `mur-ligase-ligand-preparation/1` record,
+tied by digest to both the manifest and the exact prepared PDBQT it describes.
+
+A manifest that an earlier `check` already modified in place stays usable. The
+downstream gates restore that one known top-level `preparation` block to the
+shape it held before that stage and accept the manifest only when the restored
+form reproduces the recorded digest **exactly**; the basis is recorded as
+`legacy_compatibility_used`, so a compatibility match is visible as one. No
+historical hash is rewritten, and a change to the component, the protonation
+state, the reference or the dictionary cannot be restored into agreement.
+
+A failed check still writes its record, with `result: "failed"` and the
+reasons, so the diagnostic detail is kept; downstream readers gate on
+`result`.
 
 With `--atom-map`, atoms are keyed by the validated mapping. **Without it the
 name-based check stays strict** and refuses a repeated atom name, which is the
@@ -644,60 +679,128 @@ hydrogens added, the AutoDock type census, the charge sum, `TORSDOF` and the
 ### Stage 7 — the independent RMSD comparison (RDKit)
 
 This is a **prerequisite for interpreting the control**, not an optional
-cross-check, and it must use the **same protonation state and the same
-chemically allowed atom equivalences** as this project's implementation.
-Otherwise a disagreement would only show that two different quantities were
-computed.
+cross-check. `chemical_graph.symmetry_aware_rmsd` is a custom implementation
+whose own unit tests are not independent of it, so before the control's
+numbers mean anything it has to agree with an established toolkit on
+structures whose answer is fixed by something outside both implementations.
+
+`python/independent_rmsd.py` runs the comparison and writes the record
+`analyse_redocking.py --independent-rmsd` validates. Run it once per modelled
+state, against that state's own manifest and verification record:
 
 ```bash
-python - <<'PY_INNER'
-import json, sys
-sys.path.insert(0, "python")
-from rdkit import Chem
-from rdkit.Chem import rdMolAlign
-import chemical_component, chemical_graph
+# The -3 state.
+python python/independent_rmsd.py \
+    ligands/uma.ligand.json ligands/uma_verified_v2.verification.json \
+    --out analysis/uma_minus3.independent_rmsd.json
 
-manifest = json.load(open("ligands/uma.ligand.json"))
-deprotonated = set(manifest["protonation_state"]["deprotonated_atoms"])
-
-# Same protonation state on both sides: RDKit perceives equivalence from the
-# molecule it is given, so it must be given the charged molecule, not the
-# neutral dictionary form.
-component = chemical_component.read_component(manifest["dictionary"]["path"])
-still = sorted(set(component.hydrogens_on) - deprotonated)
-graph, resonance = chemical_graph.normalise_resonance(
-    component.graph, hydrogen_bearing=still)
-permutations = chemical_graph.automorphisms(graph)
-print("this project: automorphisms", len(permutations))
-print("orbits:", chemical_graph.symmetry_classes(graph, permutations))
-print("resonance groups:", resonance)
-
-# RDKit side: CalcRMS is symmetry-corrected and applies NO alignment, which
-# is the same quantity this project computes.
-reference = Chem.MolFromMolFile("ligands/uma_ligand.mol", removeHs=True,
-                                sanitize=True)
-for label, pose_file in (("near", "analysis/pose_near.mol"),
-                         ("distant", "analysis/pose_distant.mol"),
-                         ("oxygens relabelled", "analysis/pose_swapped.mol")):
-    pose = Chem.MolFromMolFile(pose_file, removeHs=True, sanitize=True)
-    print(f"{label:20s} RDKit CalcRMS:", rdMolAlign.CalcRMS(pose, reference))
-PY_INNER
+# The -2 sensitivity state.
+python python/independent_rmsd.py \
+    ligands/uma_minus2.ligand.json \
+    ligands/uma_minus2_verified.verification.json \
+    --out analysis/uma_minus2.independent_rmsd.json
 ```
 
-Compare each value with the RMSD this project reports for the same pose, which
-appears in `<out>_per_pose.csv` alongside
-`atoms_exchanged_by_the_minimising_mapping` — the mapping that achieved the
-minimum, recorded by atom name precisely so a disagreement can be diagnosed.
+Each run reads the **verified hydrogenated molfile** the verification record
+names, checks its digest, and refuses to proceed on an unverified molecule or
+a manifest the verification did not describe.
+
+#### What makes it independent
+
+Three things, and they are the point of the stage:
+
+1. **Analytic cases.** A rigid translation by a vector of length *d* moves
+   every atom by exactly *d*, so an unfitted RMSD is exactly *d*. That
+   expectation is geometric and belongs to neither implementation, so the
+   translation cases have a third answer to be checked against.
+2. **Equivalences are verified, not assumed.** RDKit perceives symmetry from
+   the molecule it is handed, so it is handed the *charged* molecule the
+   verification wrote, never the neutral dictionary form. Its own perceived
+   classes are then read back out with
+   `CanonicalRankAtoms(breakTies=False)` and compared with this project's
+   resonance-normalised orbits. A disagreement fails the record. RDKit's
+   self-matches are also enumerated independently with
+   `GetSubstructMatches(mol, mol, uniquify=False, useChirality=True)`, and
+   whether that enumeration reached its match limit is recorded. **Those
+   self-matches are not a confirmed list of the mappings `CalcRMS` uses**:
+   CalcRMS is a separate routine with its own options, and that
+   correspondence has not been checked against the installed implementation.
+
+#### The selected configuration, and the diagnostic one
+
+`CalcRMS` has its own option `symmetrizeConjugatedTerminalGroups`, which
+**defaults to true** and symmetrises a conjugated terminal group whether or
+not its oxygens are protonated. One configuration is therefore *selected* on
+intent, before any value is seen, as the one meant to respect this project's
+protonation-dependent equivalences:
+
+- **Selected (binding): `symmetrizeConjugatedTerminalGroups=True`.** A
+  justified terminal-oxygen swap must evaluate to zero, and the unsymmetrised
+  setting cannot give that, because the molfile records one double and one
+  single bond to the group's oxygens. Only this configuration's failures
+  block validation.
+- **Diagnostic (reported, not binding): `False`.** It describes a different
+  equivalence rule, so its disagreement is reported prominently in the
+  record's `diagnostics` block and does **not** invalidate a selected
+  configuration that passes every required check on its own.
+
+The selected setting is more permissive than this project's rule, since it
+symmetrises regardless of protonation. That gap is exactly what the
+protonation negative case measures: a zero there **fails the selected
+configuration**, and the record says the gap needs a decision. If neither
+setting reproduces the intended equivalences and values, validation fails.
+**Do not widen the tolerance or change the equivalence rule to force
+agreement**, and do not reselect whichever setting happens to agree.
+3. **Our automorphism list is never given to RDKit.** Supplying our own
+   permutations as RDKit's atom map would make the check circular: it would
+   confirm only that two routines evaluate the same mapping, not that they
+   agree on which mappings are chemically allowed.
+
+#### The cases
+
+Generated deterministically from the verified coordinates, with no randomness
+and no embedding:
+
+| Case | Expected | Why |
+| --- | --- | --- |
+| `unchanged` | exactly 0 | the coordinates as verified |
+| `translation_small` | exactly 0.25 Å | rigid translation; geometric expectation |
+| `translation_large` | exactly 5.0 Å | as above, well beyond any pose criterion |
+| `swap_<centre>` | exactly 0 | two terminal oxygens exchanged at a centre whose oxygens are **all deprotonated**, so they are delocalised and interchangeable: the same structure |
+| `negative_swap_<centre>` | non-zero | a **protonated** and an **unprotonated** terminal oxygen exchanged at the same centre |
+
+The negative case is the one that matters. In the −2 state PB retains a
+proton on one terminal oxygen, so exchanging it with PB's unprotonated
+terminal oxygen describes a **different structure**: the two differ in bond
+length and hydrogen-bonding role, and a measure that returned zero there
+would let a wrong pose pass. Both implementations must return a non-zero
+value, and the record fails if either returns zero. Agreement on the
+unchanged and translated cases alone proves very little.
+
+#### Reading the result
+
+The record states its own verdict. `result: "passed"` requires every case to
+agree within the tolerance (10⁻⁶ Å, which leaves room only for
+floating-point summation order), this project's values to meet the geometric
+expectations, the negative case to be distinguished by both sides, and the
+perceived equivalences to match. Anything else is `"failed"` with the reasons
+listed, and `analyse_redocking.py` then reports the prerequisite unsatisfied.
 
 **If the two disagree, investigate both implementations and both mappings.**
 Neither is presumed right: RDKit's substructure-match symmetry perception and
 this project's resonance-normalised graph automorphisms can legitimately
-differ in what they consider equivalent, and the first thing to compare is the
-set of exchanged atoms, not the numbers. Record the outcome in
-`analysis/uma.independent_rmsd.json`, the file
-`analyse_redocking.py --independent-rmsd` expects. The "oxygens relabelled"
-case is the one that actually exercises the symmetry handling; agreement on
-the near and distant cases alone proves little.
+differ in what they consider equivalent, and the first thing to compare is
+the exchanged-atom sets the record carries, not the numbers.
+
+#### What this stage does not establish
+
+The cases are **synthetic coordinate transformations of one deposited
+structure**. They validate software. They are not docking results, not poses,
+and not evidence about binding; the record labels itself
+`content_class: "synthetic software validation..."` so it cannot be quoted as
+a docking outcome. Agreement does not prove either implementation correct for
+every molecule, and no stereochemistry is tested, since a swap of equivalent
+oxygens is stereochemically inert.
 
 ## Stage 8: full docking searches (a later milestone)
 
@@ -755,10 +858,18 @@ for SIZE in 24 30 33; do
       --ligand-manifest ligands/uma.ligand.json \
       --atom-map ligands/uma.atom_map.json \
       --stereo-verification ligands/uma_verified_v2.verification.json \
-      --independent-rmsd analysis/uma.independent_rmsd.json \
+      --independent-rmsd analysis/uma_minus3.independent_rmsd.json \
       --out analysis/uma_control_${SIZE}A
 done
 ```
+
+Both prerequisites are now **validated, not merely counted**. The
+stereochemistry record must state a passing result, report no fatal mismatch
+and describe the manifest being analysed. The independent-RMSD record must
+state a passing result, report agreement on every case and the negative case
+as distinguished, confirm the equivalences were verified against the toolkit's
+own perception, and declare `superposition: "none"` — a fitted RMSD is a
+different quantity. A record that merely exists satisfies neither.
 
 ### Pose provenance: by campaign record, not by file hash
 
