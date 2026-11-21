@@ -864,3 +864,297 @@ LIG "O3'" "HO3'" SING N N
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# CLI orchestration of the comparison
+# ---------------------------------------------------------------------------
+
+class StubConformer:
+    def __init__(self, positions):
+        self._positions = [tuple(p) for p in positions]
+
+    def GetAtomPosition(self, index):
+        x, y, z = self._positions[index]
+        return type("Point", (), {"x": x, "y": y, "z": z})()
+
+    def SetAtomPosition(self, index, point):
+        self._positions[index] = (point.x, point.y, point.z)
+
+
+class StubAtom:
+    def __init__(self, index):
+        self._index = index
+
+    def GetIdx(self):
+        return self._index
+
+    def GetPropsAsDict(self):
+        # A molfile carries no atom names, which is the real case: the code
+        # must fall back to indices rather than invent names.
+        return {}
+
+
+class StubMol:
+    """A molecule just rich enough for the orchestration under test.
+
+    Its self-matches are hand-declared, not derived from this project's
+    automorphism code, so the stub does not smuggle our own answer back in.
+    """
+
+    def __init__(self, positions, self_matches):
+        self._conformer = StubConformer(positions)
+        self._self_matches = tuple(self_matches)
+
+    def GetNumAtoms(self):
+        return len(self._conformer._positions)
+
+    def GetConformer(self):
+        return self._conformer
+
+    def GetAtoms(self):
+        return [StubAtom(i) for i in range(self.GetNumAtoms())]
+
+    def GetSubstructMatches(self, other, uniquify=True, useChirality=False,
+                            maxMatches=1000):
+        return self._self_matches[:maxMatches]
+
+    def copy(self):
+        return StubMol(list(self._conformer._positions), self._self_matches)
+
+
+def install_stub_rdkit(molecule, symmetric_permutation):
+    """Install a fake `rdkit` package and return a teardown callable.
+
+    **This stub validates wiring only.** It does not validate RDKit chemistry:
+    it is not RDKit, it perceives nothing, and its CalcRMS minimises over a
+    permutation set written by hand in the test. Nothing it reports is
+    evidence about what real RDKit does with UMA.
+    """
+    import math
+    import types
+
+    def calc_rms(probe, reference, symmetrizeConjugatedTerminalGroups=True):
+        first = reference.GetConformer()._positions
+        second = probe.GetConformer()._positions
+        candidates = [tuple(range(len(first)))]
+        if symmetrizeConjugatedTerminalGroups:
+            candidates.append(tuple(symmetric_permutation))
+        best = None
+        for permutation in candidates:
+            total = sum(
+                sum((a - b) ** 2 for a, b in zip(first[i], second[permutation[i]]))
+                for i in range(len(first)))
+            value = math.sqrt(total / len(first))
+            best = value if best is None else min(best, value)
+        return best
+
+    rdkit = types.ModuleType("rdkit")
+    chem = types.ModuleType("rdkit.Chem")
+    rdmolalign = types.ModuleType("rdkit.Chem.rdMolAlign")
+    allchem = types.ModuleType("rdkit.Chem.AllChem")
+    geometry = types.ModuleType("rdkit.Geometry")
+    rdbase = types.ModuleType("rdkit.rdBase")
+
+    rdbase.rdkitVersion = "stub-0.0"
+    rdmolalign.CalcRMS = calc_rms
+    chem.MolFromMolFile = lambda path, removeHs=True, sanitize=True: molecule
+    chem.Mol = lambda other: other.copy()
+    chem.MolFromSmiles = lambda smiles: molecule
+    chem.AddHs = lambda mol: mol
+    # One shared rank for the symmetric pair, distinct ranks elsewhere.
+    moved = [i for i, target in enumerate(symmetric_permutation) if i != target]
+
+    def canonical_rank_atoms(mol, breakTies=False):
+        ranks = list(range(mol.GetNumAtoms()))
+        for index in moved:
+            ranks[index] = -1
+        return ranks
+
+    chem.CanonicalRankAtoms = canonical_rank_atoms
+    chem.rdMolAlign = rdmolalign
+    chem.AllChem = allchem
+    allchem.EmbedMolecule = lambda mol, randomSeed=0: 0
+    geometry.Point3D = lambda x, y, z: type(
+        "Point3D", (), {"x": x, "y": y, "z": z})()
+    rdkit.Chem = chem
+    rdkit.rdBase = rdbase
+    rdkit.Geometry = geometry
+
+    modules = {
+        "rdkit": rdkit, "rdkit.Chem": chem,
+        "rdkit.Chem.rdMolAlign": rdmolalign,
+        "rdkit.Chem.AllChem": allchem,
+        "rdkit.Geometry": geometry, "rdkit.rdBase": rdbase,
+    }
+    saved = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+
+    def teardown():
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return teardown
+
+
+@unittest.skipUnless(GEMMI_AVAILABLE, "Gemmi is required")
+class ComparisonOrchestrationTests(unittest.TestCase):
+    """The CLI path through `_run`, which a compare()-only test cannot cover.
+
+    This is the regression guard for the crash at the `compare()` call site:
+    `_run` passed a parameter name that no longer existed, which every test
+    of `compare()` in isolation missed because none of them went through
+    `_run`.
+
+    **RDKit is stubbed.** These tests validate orchestration and the
+    selected-versus-diagnostic wiring. They validate **no RDKit chemistry**
+    whatsoever: the stub is not RDKit, and its values prove nothing about
+    what real RDKit computes for UMA.
+    """
+
+    def setUp(self):
+        import argparse
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        self.argparse = argparse
+
+        self.ccd = self.root / "LIG.cif"
+        self.ccd.write_text(COMPONENT_CIF)
+        component = chemical_component.read_component(self.ccd)
+        self.names = list(component.graph.names)
+
+        coordinates = {name: position
+                       for name, _, position in REFERENCE_ATOMS}
+        positions = [coordinates[name] for name in self.names]
+
+        # O1 and O2 are C2's terminal oxygens; both are deprotonated at this
+        # state, so exchanging them is the justified swap. Declared by hand.
+        first, second = self.names.index("O1"), self.names.index("O2")
+        permutation = list(range(len(self.names)))
+        permutation[first], permutation[second] = second, first
+        self.permutation = permutation
+        self.molecule = StubMol(positions,
+                                [tuple(range(len(self.names))),
+                                 tuple(permutation)])
+
+        self.manifest = self.root / "lig.ligand.json"
+        write(self.manifest, {
+            "schema": "mur-ligase-ligand/1",
+            "component": "LIG",
+            "protonation_state": {"modelled_ph": 7.4,
+                                  "modelled_formal_charge": -1,
+                                  "deprotonated_atoms": ["O2"]},
+            "reference": {"path": str(self.root / "lig.reference.json")},
+            "dictionary": {"path": str(self.ccd)},
+            "preparation": {"performed": False},
+        })
+        self.molfile = self.root / "lig_withH.mol"
+        self.molfile.write_text("stub molfile; the stub reader ignores it\n")
+        self.verification = self.root / "lig.verification.json"
+        write(self.verification, {
+            "schema": "mur-ligase-ligand-verification/1",
+            "result": "passed", "state": "minus1",
+            "tools": {"rdkit": "stub-0.0"},
+            "inputs": {
+                "ligand_manifest_sha256": provenance.file_digest_of(
+                    self.manifest)},
+            "outputs": {
+                "hydrogenated_molfile": str(self.molfile),
+                "hydrogenated_molfile_sha256": provenance.file_digest_of(
+                    self.molfile)},
+            "checks": {"stereochemistry_before_hydrogens":
+                       {"fatal_mismatches": [], "requires_investigation": []}},
+        })
+        self.addCleanup(
+            install_stub_rdkit(self.molecule, self.permutation))
+
+    def run_comparison(self, **overrides):
+        options = {
+            "ligand_manifest": self.manifest,
+            "verification_record": self.verification,
+            "out": self.root / "comparison.json",
+            "component_dictionary": self.ccd,
+            "tolerance": independent_rmsd.AGREEMENT_TOLERANCE_ANGSTROM,
+            "overwrite": True,
+        }
+        options.update(overrides)
+        independent_rmsd._run(self.argparse.Namespace(**options))
+        return json.loads((options["out"]).read_text())
+
+    def test_the_cli_path_runs_and_writes_a_record(self):
+        """The regression: `_run` must reach `compare` with a valid argument."""
+        record = self.run_comparison()
+        self.assertEqual(record["schema"], "mur-ligase-independent-rmsd/1")
+        self.assertEqual(record["result"], "passed", record["failure_reasons"])
+
+    def test_the_selected_configuration_reaches_the_verdict(self):
+        """Not just present in the record: actually the one judged."""
+        record = self.run_comparison()
+        selected = record["measure"]["selected_configuration"]["variant"]
+        self.assertEqual(selected, independent_rmsd.SELECTED_VARIANT)
+        for row in record["cases"]:
+            self.assertEqual(row["toolkit_variant_judged"], selected,
+                             f"{row['label']} was judged under another "
+                             f"configuration than the record claims binding")
+            self.assertIn(selected, row["toolkit_angstrom_by_variant"])
+
+    def test_the_diagnostic_variant_is_recorded_and_not_binding(self):
+        """The unsymmetrised setting disagrees on the justified swap.
+
+        The stub's CalcRMS minimises over the hand-declared pair only when
+        symmetrising, so the diagnostic setting scores the oxygen separation
+        where this project scores zero. The record must pass on the selected
+        configuration and report the disagreement.
+        """
+        record = self.run_comparison()
+        self.assertEqual(record["result"], "passed", record["failure_reasons"])
+        diagnostics = record["diagnostics"]
+        self.assertIn(independent_rmsd.UNSYMMETRISED_VARIANT,
+                      diagnostics["variants"])
+        self.assertGreater(diagnostics["n_disagreements"], 0)
+        self.assertTrue(any(entry["case"].startswith("swap_")
+                            for entry in diagnostics["disagreements"]))
+        self.assertIn("not binding", diagnostics["status"])
+
+    def test_the_case_set_and_negative_applicability_come_through(self):
+        record = self.run_comparison()
+        labels = [row["label"] for row in record["cases"]]
+        self.assertEqual(labels[:3],
+                         ["unchanged", "translation_small", "translation_large"])
+        self.assertTrue(any(label.startswith("swap_") for label in labels))
+        negative = record["negative_cases"]
+        # Nothing is both protonated and unprotonated at one centre here, as
+        # in the -3 state, so that case must be not applicable with a reason.
+        self.assertFalse(negative["protonation_oxygen_swap"]["applicable"])
+        self.assertIn("property of the state",
+                      negative["protonation_oxygen_swap"]["reason"])
+        self.assertTrue(negative["element_swap"]["applicable"])
+        self.assertTrue(record["checks"]["negative_case_distinguished"])
+
+    def test_the_self_matches_are_not_claimed_as_calcrms_mappings(self):
+        record = self.run_comparison()
+        matches = record["measure"]["toolkit_options"]["self_matches"]
+        self.assertIn("NOT verified", matches["relationship_to_calcrms"])
+        self.assertFalse(matches["reached_match_limit"])
+        self.assertTrue(matches["enumeration_complete"])
+
+    def test_a_toolkit_missing_the_selected_configuration_is_refused(self):
+        """Guard against the class of bug this test file was added for.
+
+        If the selected configuration is absent from the toolkit's results,
+        the comparison must refuse rather than quietly record every case as
+        unevaluated.
+        """
+        cases = [independent_rmsd.SyntheticCase(
+            label="unchanged", kind="identity", coordinates={"C1": (0, 0, 0)},
+            expected_angstrom=0.0, equivalence_class="equivalent",
+            justification="fixture")]
+        graph = graph_module.graph_from_bond_names(["C1"], ["C"], [])
+        with self.assertRaises(independent_rmsd.ComparisonError) as caught:
+            independent_rmsd.compare(
+                cases, {"C1": (0.0, 0.0, 0.0)}, graph, [(0,)],
+                lambda case: {"some_other_variant": 0.0})
+        self.assertIn("selected configuration", str(caught.exception))

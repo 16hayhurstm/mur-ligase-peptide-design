@@ -510,6 +510,18 @@ def compare(cases: Sequence[SyntheticCase],
         returned = toolkit_rmsd(case)
         if isinstance(returned, dict):
             variants = returned
+            if selected_variant not in variants:
+                # The selected configuration is the one the verdict is made
+                # under. If the toolkit produced no entry for it at all, that
+                # is a wiring or build-support problem, not a per-case
+                # evaluation failure, and it must not be read as a silent
+                # "unevaluated" that merely fails the record obscurely.
+                raise ComparisonError(
+                    f"the toolkit returned no result for the selected "
+                    f"configuration {selected_variant!r} on case "
+                    f"{case.label!r}; it returned {sorted(variants)}. The "
+                    f"verdict is made under the selected configuration, so "
+                    f"the comparison cannot proceed without it")
             theirs = variants.get(selected_variant)
         else:
             variants = {selected_variant: returned}
@@ -1109,8 +1121,24 @@ def _run(args: argparse.Namespace) -> None:
     supports_flag = toolkit_options[
         "symmetrize_conjugated_terminal_groups_supported"]
 
+    if SELECTED_VARIANT == UNSYMMETRISED_VARIANT and not supports_flag:
+        raise ComparisonError(
+            f"the selected configuration is {SELECTED_VARIANT!r}, but the "
+            f"installed CalcRMS does not accept "
+            f"symmetrizeConjugatedTerminalGroups, so the selected "
+            f"configuration cannot be evaluated on this build. The verdict "
+            f"is made under the selected configuration, so the comparison "
+            f"would be meaningless")
+
     def toolkit_rmsd(case: SyntheticCase) -> dict[str, float | None]:
-        """Both option sets, so the flag's effect is measured, not assumed."""
+        """Both option sets, so the flag's effect is measured, not assumed.
+
+        The symmetrised setting is CalcRMS's default and needs no keyword, so
+        it is always evaluated; the unsymmetrised one is evaluated only where
+        the installed build accepts the flag. Whichever is `SELECTED_VARIANT`
+        is the one the verdict is made under, and `compare` refuses to proceed
+        if it is missing.
+        """
         probe = _posed_copy(molecule, names, case.coordinates)
         values: dict[str, float | None] = {}
         try:
@@ -1127,9 +1155,14 @@ def _run(args: argparse.Namespace) -> None:
                 values[UNSYMMETRISED_VARIANT] = None
         return values
 
+    # SELECTED_VARIANT, not the symmetrised constant directly: it is the single
+    # source of truth for which configuration is binding, and it is what
+    # assemble_record writes into measure.selected_configuration. Naming the
+    # setting here instead would let the rows be judged under one
+    # configuration while the record claimed another was binding.
     rows = compare(cases, reference_coordinates, graph, permutations,
                    toolkit_rmsd, tolerance=args.tolerance,
-                   primary_variant=SYMMETRISED_VARIANT)
+                   selected_variant=SELECTED_VARIANT)
 
     record = assemble_record(
         state=str(verification.get("state")),
