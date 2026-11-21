@@ -8,33 +8,52 @@ understanding of the problem. Before the redocking control's numbers mean
 anything, the implementation has to agree with an established toolkit on
 structures whose answer is known for reasons outside both implementations.
 
-What is compared, and what makes it independent
------------------------------------------------
-RDKit's `rdMolAlign.CalcRMS` is the comparator because it is symmetry-corrected
-and applies **no superposition**, which is the quantity this project computes.
-Three things keep the comparison honest:
+Two separate validations
+------------------------
+The real Epicac runs at 52dcfef showed these are different questions and must
+not share a gate. The -3 state agreed on every number while failing the
+equivalence-class comparison; the -2 state agreed on the classes while
+automatic symmetrisation accepted an exchange this project's measure forbids,
+scoring 0 A where the measure gives 0.526446 A.
 
-1. **Analytic cases.** A rigid translation by a vector of length *d* moves
-   every atom by exactly *d*, so the in-place RMSD is exactly *d* for any
-   atom correspondence that is the identity on a rigid body. That expectation
-   comes from geometry, not from either implementation, so the translation
-   cases have a third, independent answer.
-2. **Equivalences are verified, not assumed, at three levels.** RDKit
-   perceives symmetry from the molecule it is handed, so it is handed the
-   *charged* molecule the verification wrote, not the neutral dictionary
-   form. Then: its perceived equivalence classes are read back out and
-   compared with this project's orbits; the self-mappings its substructure
-   match permits -- which is what `CalcRMS` actually minimises over -- are
-   enumerated and recorded; and its own option set is read off the installed
-   build. That last one matters, because
-   `symmetrizeConjugatedTerminalGroups` **defaults to true** and makes
-   CalcRMS treat a conjugated terminal group's atoms as interchangeable
-   regardless of this project's protonation rule. Both settings are
-   evaluated, so the flag's effect is measured rather than assumed.
-3. **This project's automorphism list is never supplied to RDKit.** Passing
-   our own permutations in as RDKit's atom map would make the check circular:
-   it would then only confirm that two routines evaluate the same mapping, not
-   that they agree on which mappings are chemically allowed.
+**1. The allowed mappings.** `oxygen_pair_audit` audits each explicitly named
+terminal-oxygen pair against the dictionary's connectivity and hydrogen
+attachment at the modelled state, taking nothing from `chemical_graph` or its
+automorphisms. The full audited mapping set is then compared with the set this
+project's implementation actually minimises over -- the sets themselves, not
+only the orbits they induce, since different sets can induce the same orbits.
+A mismatch blocks validation.
+
+**2. The numerical calculation.** CalcRMS is given that audited mapping set
+through its own `map` argument, with `symmetrizeConjugatedTerminalGroups`
+switched **off**, so both sides minimise over one shared, reviewed convention
+and the only thing left to disagree about is the arithmetic. No superposition
+is applied on either side.
+
+RDKit's automatic symmetrisation is retained as a **diagnostic**: it
+implements a more permissive convention, which is exactly what the -2 run
+demonstrated, so judging agreement under it would test the wrong rule. Its
+canonical ranks and self-matches are likewise diagnostics, and neither is
+presented as the mapping set symmetrised CalcRMS uses.
+
+Still independent of this project, on both validations:
+
+- The audited convention is derived from the dictionary in a separate module
+  that never consults `chemical_graph`.
+- A rigid translation by a vector of length *d* moves every atom by exactly
+  *d*, so an unfitted RMSD is exactly *d*. That expectation is geometric and
+  belongs to neither implementation.
+- This project's automorphism list is never handed to the toolkit as its
+  mapping. The maps CalcRMS receives come from the audit.
+
+What this establishes
+---------------------
+That the numerical implementation agrees with an established toolkit **under
+an explicitly audited chemical mapping convention**. It is not independent
+experimental validation of the chemistry: the convention is a recorded
+judgement about the dictionary, reviewable pair by pair, and agreement under
+it says the two implementations compute the same quantity over the same
+permitted mappings. Nothing more.
 
 The cases
 ---------
@@ -102,6 +121,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_geometry
 import chemical_component
 import chemical_graph
+import oxygen_pair_audit
 import receptor_provenance as provenance
 
 SCHEMA = "mur-ligase-independent-rmsd/1"
@@ -121,30 +141,49 @@ TRANSLATION_LARGE_ANGSTROM = 5.0
 # components, so a transposed or dropped coordinate cannot cancel out.
 TRANSLATION_AXIS = (2.0 / 3.0, -1.0 / 3.0, 2.0 / 3.0)
 
-SYMMETRISED_VARIANT = "symmetrised_conjugated_terminal_groups"
-UNSYMMETRISED_VARIANT = "no_conjugated_terminal_group_symmetrisation"
+# The toolkit configurations evaluated.
+#
+# AUDITED_MAP_VARIANT is the **selected** one: CalcRMS given an explicitly
+# audited mapping set and with automatic conjugated terminal-group
+# symmetrisation switched off. Only its failures block validation.
+#
+# AUTO_SYMMETRISED_VARIANT is retained as a **diagnostic**. The real -2 run at
+# 52dcfef showed why it cannot be the selected configuration: it accepted the
+# PB protonated/unprotonated oxygen swap, scoring 0 A where this project's
+# measure scores 0.526446 A. That setting symmetrises a conjugated terminal
+# group whether or not its oxygens are protonated, so it implements a more
+# permissive convention than the one being validated. Its results are
+# reported, never binding.
+AUDITED_MAP_VARIANT = "audited_mapping_no_auto_symmetrisation"
+AUTO_SYMMETRISED_VARIANT = "automatic_conjugated_terminal_group_symmetrisation"
 
-# The configuration the comparison is *made under*. Chosen on intent, not on
-# whichever setting happens to agree: this project treats a terminal-oxygen
-# group as interchangeable when every one of its oxygens is deprotonated, and
-# the symmetrising setting is the only one that can return zero for such a
-# justified swap, because the connection table still carries one double and
-# one single bond. Only this configuration's failures block validation.
-SELECTED_VARIANT = SYMMETRISED_VARIANT
+# The former names are deliberately not kept as aliases: UNSYMMETRISED_VARIANT
+# would now resolve to the selected configuration, inverting its old meaning.
+
+SELECTED_VARIANT = AUDITED_MAP_VARIANT
 
 SELECTION_JUSTIFICATION = (
-    "CalcRMS with symmetrizeConjugatedTerminalGroups=True is selected because "
-    "a justified terminal-oxygen swap must evaluate to zero, and the "
-    "unsymmetrised setting cannot give that: the molfile records one double "
-    "and one single bond to the group's oxygens, so without symmetrisation "
-    "the toolkit treats them as distinguishable and a chemically equivalent "
-    "swap would score non-zero. The selected setting is nonetheless more "
-    "permissive than this project's rule, since it symmetrises a conjugated "
-    "terminal group whether or not its oxygens are protonated. That gap is "
-    "exactly what the protonation negative case measures, and a zero there "
-    "fails the selected configuration rather than being tolerated."
+    "CalcRMS is given the explicitly audited mapping set, with "
+    "symmetrizeConjugatedTerminalGroups=False, and that configuration is "
+    "selected. The mapping set comes from oxygen_pair_audit, which reads "
+    "connectivity and hydrogen attachment from the component dictionary and "
+    "takes nothing from chemical_graph or its automorphisms, so the toolkit "
+    "and this project minimise over the same independently established "
+    "convention. Automatic symmetrisation is not selected because the real "
+    "-2 run showed it accepting the PB protonated/unprotonated oxygen swap "
+    "that this project's protonation rule forbids: it implements a different, "
+    "more permissive convention, and judging agreement under it would test "
+    "the wrong rule. It is kept as a diagnostic."
 )
 
+VALIDATION_STATUS = (
+    "This independently checks the numerical implementation under an "
+    "explicitly audited chemical mapping convention. It is NOT independent "
+    "experimental validation of the chemistry: the convention itself is a "
+    "recorded judgement about the dictionary, and agreement under it "
+    "establishes that two implementations compute the same quantity over the "
+    "same permitted mappings, nothing more."
+)
 
 
 class ComparisonError(RuntimeError):
@@ -589,6 +628,7 @@ def assemble_record(state: str,
                     equivalence: dict[str, object],
                     rows: Sequence[dict[str, object]],
                     plan: dict[str, dict[str, object]] | None = None,
+                    mapping_audit: dict[str, object] | None = None,
                     toolkit_options: dict[str, object] | None = None,
                     tolerance: float = AGREEMENT_TOLERANCE_ANGSTROM
                     ) -> dict[str, object]:
@@ -692,11 +732,18 @@ def assemble_record(state: str,
             f"forbids, so the two measures are not computing the same "
             f"quantity. Neither the tolerance nor the equivalence rule may be "
             f"changed to force agreement; this needs a decision")
-    if not equivalence.get("agree"):
+    if mapping_audit is not None and not mapping_audit.get("mapping_sets_agree"):
         failures.append(
-            "the toolkit's perceived atom equivalences do not match this "
-            "project's orbits, so the two measures may not be computing the "
-            "same quantity")
+            f"the audited mapping set and the set this project's "
+            f"implementation minimises over are not the same: "
+            f"{mapping_audit['n_audited_mappings']} audited against "
+            f"{mapping_audit['n_implementation_mappings']} in the "
+            f"implementation, audited-only exchanges "
+            f"{mapping_audit['only_in_the_audited_set']}, "
+            f"implementation-only {mapping_audit['only_in_the_implementation_set']}. "
+            f"The numerical comparison is only meaningful over one shared "
+            f"convention, so this blocks validation; do not reconcile it by "
+            f"changing the equivalence rule")
 
     # Diagnostics: the configurations that were not selected. Disagreement
     # here is reported prominently and does not invalidate a selected
@@ -763,7 +810,9 @@ def assemble_record(state: str,
             "selected_configuration": {
                 "variant": SELECTED_VARIANT,
                 "symmetrize_conjugated_terminal_groups": (
-                    SELECTED_VARIANT == SYMMETRISED_VARIANT),
+                    SELECTED_VARIANT == AUTO_SYMMETRISED_VARIANT),
+                "mappings_supplied_from_the_audit": (
+                    SELECTED_VARIANT == AUDITED_MAP_VARIANT),
                 "selected_on": ("intent: the configuration meant to respect "
                                 "this project's protonation-dependent "
                                 "equivalences, chosen before the values were "
@@ -782,6 +831,8 @@ def assemble_record(state: str,
                      "own options decide which mappings it permits, so they "
                      "are recorded above rather than assumed"),
         },
+        "validation_status": VALIDATION_STATUS,
+        "allowed_mappings": mapping_audit,
         "terminal_oxygen_groups": list(groups),
         "negative_cases": negative_detail,
         "diagnostics": diagnostics,
@@ -802,8 +853,12 @@ def assemble_record(state: str,
             "diagnostic_permitted_an_inequivalent_mapping": diagnostic_equivalent,
             "diagnostic_disagreements": len(diagnostic_disagreements),
             "n_inequivalent_cases": len(negatives),
+            "allowed_mappings_independently_audited": bool(
+                mapping_audit is not None
+                and mapping_audit.get("mapping_sets_agree")),
             "equivalences_independently_verified": bool(
-                equivalence.get("agree")),
+                mapping_audit is not None
+                and mapping_audit.get("mapping_sets_agree")),
         },
         "limitations": [
             "synthetic coordinate transformations of one deposited structure: "
@@ -866,8 +921,8 @@ def _calcrms_options() -> dict[str, object]:
         "project normalises a terminal-oxygen group only when every one of "
         "its oxygens is deprotonated, so the two rules can differ, and the "
         "comparison evaluates both settings rather than trusting either")
-    options["variants_evaluated"] = [SYMMETRISED_VARIANT,
-                                     UNSYMMETRISED_VARIANT]
+    options["variants_evaluated"] = [AUDITED_MAP_VARIANT,
+                                     AUTO_SYMMETRISED_VARIANT]
     return options
 
 
@@ -1057,6 +1112,9 @@ def _run(args: argparse.Namespace) -> None:
     dictionary_path = Path(args.component_dictionary
                            or manifest["dictionary"]["path"])
     component = chemical_component.read_component(dictionary_path)
+    # Parsed a second time, by the auditor, from the dictionary alone: the
+    # audited convention must not inherit this project's graph construction.
+    chemistry = oxygen_pair_audit.read_dictionary_chemistry(dictionary_path)
     deprotonated = set(manifest["protonation_state"]["deprotonated_atoms"])
     still_protonated = sorted(set(component.hydrogens_on) - deprotonated)
     graph, resonance = chemical_graph.normalise_resonance(
@@ -1079,39 +1137,66 @@ def _run(args: argparse.Namespace) -> None:
                conformer.GetAtomPosition(index).z)
         for index, name in enumerate(names)}
 
-    # Equivalences are verified rather than assumed: RDKit's own perception,
-    # read off the charged molecule it was handed, against our orbits.
-    our_orbits = orbits_as_sets(
-        chemical_graph.symmetry_classes(graph, permutations))
-    their_orbits = _rdkit_equivalence_classes(molecule)
-    ours_named = _nontrivial(our_orbits)
-    theirs_named = _nontrivial(their_orbits)
-    # RDKit's canonical ranking keys atoms by index when a molfile carries no
-    # names, so compare the partitions by index where names are unavailable.
-    if all(group and group[0].isdigit() for group in theirs_named):
-        index_of = {name: str(position) for position, name in enumerate(names)}
-        ours_named = sorted(sorted(index_of[name] for name in group)
-                            for group in ours_named)
+    # ------------------------------------------------------------------
+    # Validation 1: the allowed mappings.
+    #
+    # The audited convention is established in oxygen_pair_audit from the
+    # dictionary's connectivity and hydrogen attachment, independently of
+    # chemical_graph. The gate compares that audited mapping set against the
+    # set this project's implementation actually minimises over. RDKit's
+    # canonical ranks and self-matches are recorded as diagnostics only, and
+    # are never presented as the mappings symmetrised CalcRMS uses.
+    # ------------------------------------------------------------------
+    audit = oxygen_pair_audit.audit_pairs(chemistry, deprotonated)
+    audited_mappings = oxygen_pair_audit.allowed_mappings(audit, names)
+    audited_exchanges = oxygen_pair_audit.exchanged_atom_sets(
+        audited_mappings, names)
+    our_exchanges = oxygen_pair_audit.exchanged_atom_sets(permutations, names)
+    mapping_sets_agree = (sorted(audited_mappings) == sorted(permutations))
+
+    mapping_audit = {
+        "basis": ("oxygen_pair_audit: terminal-oxygen pairs audited against "
+                  "the dictionary's connectivity and hydrogen attachment at "
+                  "the modelled state, independently of chemical_graph"),
+        "audit": audit,
+        "n_audited_mappings": len(audited_mappings),
+        "n_implementation_mappings": len(permutations),
+        "audited_exchanged_atom_sets": audited_exchanges,
+        "implementation_exchanged_atom_sets": our_exchanges,
+        "mapping_sets_agree": mapping_sets_agree,
+        "only_in_the_audited_set": [
+            list(m) for m in sorted(set(audited_mappings) - set(permutations))],
+        "only_in_the_implementation_set": [
+            list(m) for m in sorted(set(permutations) - set(audited_mappings))],
+        "resonance_normalisation": resonance,
+        "status": ("compares the full permitted mapping sets, not only their "
+                   "orbits: two different sets can induce the same orbits"),
+    }
+
+    # Diagnostics about RDKit's own perception. Neither of these is the set
+    # symmetrised CalcRMS minimises over, and neither gates anything.
+    canonical_ranks = _nontrivial(_rdkit_equivalence_classes(molecule))
+    ours_by_index = sorted(
+        sorted(str(names.index(name)) for name in group)
+        for group in _nontrivial(orbits_as_sets(
+            chemical_graph.symmetry_classes(graph, permutations))))
     equivalence = {
+        "role": "diagnostic only; gates nothing",
         "basis": ("RDKit CanonicalRankAtoms(breakTies=False) on the charged "
                   "molecule the verification wrote, against this project's "
-                  "resonance-normalised graph automorphism orbits"),
-        "our_nontrivial_orbits": ours_named,
-        "toolkit_nontrivial_orbits": theirs_named,
-        "agree": ours_named == theirs_named,
-        "resonance_normalisation": resonance,
+                  "resonance-normalised orbits, both keyed by atom index "
+                  "because a molfile carries no atom names"),
+        "our_nontrivial_orbits_by_index": ours_by_index,
+        "toolkit_nontrivial_orbits_by_index": canonical_ranks,
+        "agree": ours_by_index == canonical_ranks,
         "limitation": (
-            "equivalence classes say which atoms the toolkit considers "
-            "equivalent; they do not by themselves say which mappings CalcRMS "
-            "enumerates. The independently enumerated self-matches and the "
-            "toolkit's own option set are recorded under "
-            "measure.toolkit_options; neither is a confirmed list of CalcRMS "
-            "mappings, and the negative cases are what measure the selected "
-            "configuration's effect directly"),
-        "note": ("only orbits with more than one member are compared; "
-                 "singletons carry no equivalence. A disagreement does not "
-                 "show either side wrong, but it does mean the two measures "
-                 "need not compute the same quantity"),
+            "canonical ranks are NOT the mappings symmetrised CalcRMS uses, "
+            "and must not be reported as such. They describe RDKit's "
+            "perception of equivalent atoms; CalcRMS is a separate routine "
+            "with its own options. The -3 run at 52dcfef failed on this "
+            "comparison while agreeing on every number, which is itself the "
+            "evidence that the two are different questions. Validation 1 is "
+            "the mapping gate; this is a diagnostic beside it"),
     }
 
     cases = synthetic_cases(reference_coordinates, groups, plan)
@@ -1121,45 +1206,46 @@ def _run(args: argparse.Namespace) -> None:
     supports_flag = toolkit_options[
         "symmetrize_conjugated_terminal_groups_supported"]
 
-    if SELECTED_VARIANT == UNSYMMETRISED_VARIANT and not supports_flag:
+    if not supports_flag:
         raise ComparisonError(
-            f"the selected configuration is {SELECTED_VARIANT!r}, but the "
-            f"installed CalcRMS does not accept "
-            f"symmetrizeConjugatedTerminalGroups, so the selected "
-            f"configuration cannot be evaluated on this build. The verdict "
-            f"is made under the selected configuration, so the comparison "
-            f"would be meaningless")
+            "the selected configuration needs "
+            "symmetrizeConjugatedTerminalGroups=False, which the installed "
+            "CalcRMS does not accept. Automatic symmetrisation cannot be "
+            "switched off on this build, so the audited mapping convention "
+            "cannot be evaluated and the comparison would test a different "
+            "rule")
+
+    # CalcRMS takes `map` as a list of candidate correspondences, each a list
+    # of (probe index, reference index) pairs. The audited mappings are
+    # handed over in that form so the toolkit minimises over exactly the
+    # convention that was audited, with its own symmetrisation disabled.
+    calcrms_maps = [[(position, target) for position, target
+                     in enumerate(mapping)]
+                    for mapping in audited_mappings]
 
     def toolkit_rmsd(case: SyntheticCase) -> dict[str, float | None]:
-        """Both option sets, so the flag's effect is measured, not assumed.
+        """The selected configuration, plus the retained diagnostic.
 
-        The symmetrised setting is CalcRMS's default and needs no keyword, so
-        it is always evaluated; the unsymmetrised one is evaluated only where
-        the installed build accepts the flag. Whichever is `SELECTED_VARIANT`
-        is the one the verdict is made under, and `compare` refuses to proceed
-        if it is missing.
+        Selected: the audited mapping set, automatic symmetrisation off.
+        Diagnostic: CalcRMS's own default, which symmetrises conjugated
+        terminal groups regardless of protonation. Both are evaluated so the
+        difference between the two conventions stays visible in the record.
         """
         probe = _posed_copy(molecule, names, case.coordinates)
         values: dict[str, float | None] = {}
         try:
-            values[SYMMETRISED_VARIANT] = float(
+            values[AUDITED_MAP_VARIANT] = float(rdMolAlign.CalcRMS(
+                probe, molecule, map=calcrms_maps,
+                symmetrizeConjugatedTerminalGroups=False))
+        except (RuntimeError, ValueError):
+            values[AUDITED_MAP_VARIANT] = None
+        try:
+            values[AUTO_SYMMETRISED_VARIANT] = float(
                 rdMolAlign.CalcRMS(probe, molecule))
         except (RuntimeError, ValueError):
-            values[SYMMETRISED_VARIANT] = None
-        if supports_flag:
-            try:
-                values[UNSYMMETRISED_VARIANT] = float(rdMolAlign.CalcRMS(
-                    probe, molecule,
-                    symmetrizeConjugatedTerminalGroups=False))
-            except (RuntimeError, ValueError):
-                values[UNSYMMETRISED_VARIANT] = None
+            values[AUTO_SYMMETRISED_VARIANT] = None
         return values
 
-    # SELECTED_VARIANT, not the symmetrised constant directly: it is the single
-    # source of truth for which configuration is binding, and it is what
-    # assemble_record writes into measure.selected_configuration. Naming the
-    # setting here instead would let the rows be judged under one
-    # configuration while the record claimed another was binding.
     rows = compare(cases, reference_coordinates, graph, permutations,
                    toolkit_rmsd, tolerance=args.tolerance,
                    selected_variant=SELECTED_VARIANT)
@@ -1188,6 +1274,7 @@ def _run(args: argparse.Namespace) -> None:
         equivalence=equivalence,
         rows=rows,
         plan=plan,
+        mapping_audit=mapping_audit,
         toolkit_options=toolkit_options,
         tolerance=args.tolerance,
     )
@@ -1196,9 +1283,17 @@ def _run(args: argparse.Namespace) -> None:
     print(f"molecule         : {molfile}")
     print(f"state            : {record['state']}, "
           f"charge {manifest['protonation_state']['modelled_formal_charge']}")
-    print(f"equivalences     : "
-          f"{'agree' if equivalence['agree'] else 'DISAGREE'} "
-          f"(ours {ours_named} against toolkit {theirs_named})")
+    print(f"allowed mappings : "
+          f"{'AGREE' if mapping_audit['mapping_sets_agree'] else 'DISAGREE'} "
+          f"- {mapping_audit['n_audited_mappings']} audited against "
+          f"{mapping_audit['n_implementation_mappings']} in the implementation")
+    for entry in audit["audited_pairs"]:
+        verdict = "allowed" if entry["exchange_allowed"] else "REFUSED"
+        print(f"  {entry['pair'][0]}/{entry['pair'][1]} at "
+              f"{entry['centre']}: {verdict}")
+    print(f"canonical ranks  : "
+          f"{'agree' if equivalence['agree'] else 'disagree'} "
+          f"(diagnostic only; not the mappings CalcRMS uses)")
     print(f"\n{'case':28s} {'ours':>12s} {'RDKit':>12s} {'diff':>10s}  expected")
     for row in rows:
         expected = row["analytic_expectation_angstrom"]

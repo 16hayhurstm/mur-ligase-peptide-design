@@ -393,11 +393,14 @@ def validated_independent_rmsd(path: Path | None,
         problems.append(
             "the record does not report the negative case as distinguished, "
             "so a wrongly permitted oxygen exchange would not have been caught")
-    if not checks.get("equivalences_independently_verified"):
+    if not (checks.get("allowed_mappings_independently_audited")
+            or checks.get("equivalences_independently_verified")):
         problems.append(
-            "the record does not report the toolkit's own atom equivalences "
-            "as verified against this project's, so the comparison may have "
-            "been made under this project's assumptions on both sides")
+            "the record does not report the allowed mappings as "
+            "independently audited and agreeing with this project's, so the "
+            "two sides may have minimised over different conventions, or the "
+            "comparison may have been made under this project's assumptions "
+            "on both sides")
     if (record.get("measure", {}) or {}).get("superposition") != "none":
         problems.append(
             f"the record's superposition is "

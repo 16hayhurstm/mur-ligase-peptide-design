@@ -705,56 +705,60 @@ Each run reads the **verified hydrogenated molfile** the verification record
 names, checks its digest, and refuses to proceed on an unverified molecule or
 a manifest the verification did not describe.
 
-#### What makes it independent
+#### Two separate validations
 
-Three things, and they are the point of the stage:
+The real Epicac runs at `52dcfef` showed these are different questions and
+must not share a gate. The **−3** state agreed on every number while failing
+the equivalence-class comparison. The **−2** state agreed on the classes while
+automatic CalcRMS symmetrisation accepted the PB protonated/unprotonated
+oxygen swap, scoring **0 Å where this project's measure gives 0.526446 Å**.
+Both failed records are preserved as the evidence of that.
 
-1. **Analytic cases.** A rigid translation by a vector of length *d* moves
-   every atom by exactly *d*, so an unfitted RMSD is exactly *d*. That
-   expectation is geometric and belongs to neither implementation, so the
-   translation cases have a third answer to be checked against.
-2. **Equivalences are verified, not assumed.** RDKit perceives symmetry from
-   the molecule it is handed, so it is handed the *charged* molecule the
-   verification wrote, never the neutral dictionary form. Its own perceived
-   classes are then read back out with
-   `CanonicalRankAtoms(breakTies=False)` and compared with this project's
-   resonance-normalised orbits. A disagreement fails the record. RDKit's
-   self-matches are also enumerated independently with
-   `GetSubstructMatches(mol, mol, uniquify=False, useChirality=True)`, and
-   whether that enumeration reached its match limit is recorded. **Those
-   self-matches are not a confirmed list of the mappings `CalcRMS` uses**:
-   CalcRMS is a separate routine with its own options, and that
-   correspondence has not been checked against the installed implementation.
+**1. The allowed mappings.** `python/oxygen_pair_audit.py` audits every
+explicitly named terminal-oxygen pair against the dictionary's connectivity
+and hydrogen attachment at the modelled state. A pair may be exchanged only
+when both atoms are oxygen, both are terminal, both are bonded to the same
+centre, and **neither bears a hydrogen at that state**. Every candidate is
+recorded with each condition evaluated and the verdict in words, so the
+convention is reviewable pair by pair. Bond order is recorded but is *not* a
+criterion: a delocalised group is conventionally drawn with one double and one
+single bond.
 
-#### The selected configuration, and the diagnostic one
+The module parses the dictionary itself with Gemmi and takes **nothing** from
+`chemical_graph`, its orbits or its automorphisms. The full audited mapping
+set is then compared with the set this project's implementation minimises
+over — the sets themselves, not merely the orbits they induce, since different
+sets can induce the same orbits. A mismatch blocks validation.
 
-`CalcRMS` has its own option `symmetrizeConjugatedTerminalGroups`, which
-**defaults to true** and symmetrises a conjugated terminal group whether or
-not its oxygens are protonated. One configuration is therefore *selected* on
-intent, before any value is seen, as the one meant to respect this project's
-protonation-dependent equivalences:
+**2. The numerical calculation.** CalcRMS is given that audited mapping set
+through its own `map` argument, with
+`symmetrizeConjugatedTerminalGroups=False`. Both sides then minimise over one
+shared, reviewed convention and the only thing left to disagree about is the
+arithmetic. No superposition on either side.
 
-- **Selected (binding): `symmetrizeConjugatedTerminalGroups=True`.** A
-  justified terminal-oxygen swap must evaluate to zero, and the unsymmetrised
-  setting cannot give that, because the molfile records one double and one
-  single bond to the group's oxygens. Only this configuration's failures
-  block validation.
-- **Diagnostic (reported, not binding): `False`.** It describes a different
-  equivalence rule, so its disagreement is reported prominently in the
-  record's `diagnostics` block and does **not** invalidate a selected
-  configuration that passes every required check on its own.
+**Retained as diagnostics, binding on nothing:** the automatic-symmetrisation
+results, including the −2 PB finding, and RDKit's canonical ranks and
+self-matches. Automatic symmetrisation implements a more permissive convention
+than the one being validated, which is precisely what the −2 run demonstrated,
+so judging agreement under it would test the wrong rule. **Ordinary canonical
+ranks and self-matches must not be presented as the mappings symmetrised
+CalcRMS uses** — they are RDKit's perception of equivalent atoms, and CalcRMS
+is a separate routine with its own options.
 
-The selected setting is more permissive than this project's rule, since it
-symmetrises regardless of protonation. That gap is exactly what the
-protonation negative case measures: a zero there **fails the selected
-configuration**, and the record says the gap needs a decision. If neither
-setting reproduces the intended equivalences and values, validation fails.
-**Do not widen the tolerance or change the equivalence rule to force
-agreement**, and do not reselect whichever setting happens to agree.
-3. **Our automorphism list is never given to RDKit.** Supplying our own
-   permutations as RDKit's atom map would make the check circular: it would
-   confirm only that two routines evaluate the same mapping, not that they
-   agree on which mappings are chemically allowed.
+#### What this establishes, and what it does not
+
+That the numerical implementation agrees with an established toolkit **under
+an explicitly audited chemical mapping convention**. It is **not independent
+experimental validation of the chemistry**: the convention is a recorded
+judgement about the dictionary, and agreement under it says the two
+implementations compute the same quantity over the same permitted mappings,
+nothing more. The record carries this as `validation_status`.
+
+Still independent of this project: the audited convention comes from a module
+that never consults `chemical_graph`; a rigid translation of length *d* has
+the geometric expectation *d*, belonging to neither implementation; and this
+project's automorphism list is never handed to the toolkit — the maps CalcRMS
+receives come from the audit.
 
 #### The cases
 
@@ -783,14 +787,20 @@ The record states its own verdict. `result: "passed"` requires every case to
 agree within the tolerance (10⁻⁶ Å, which leaves room only for
 floating-point summation order), this project's values to meet the geometric
 expectations, the negative case to be distinguished by both sides, and the
-perceived equivalences to match. Anything else is `"failed"` with the reasons
-listed, and `analyse_redocking.py` then reports the prerequisite unsatisfied.
+**audited mapping set to be the same set** the implementation minimises over.
+Anything else is `"failed"` with the reasons listed, and
+`analyse_redocking.py` then reports the prerequisite unsatisfied. A diagnostic
+disagreement never fails the record.
 
 **If the two disagree, investigate both implementations and both mappings.**
-Neither is presumed right: RDKit's substructure-match symmetry perception and
-this project's resonance-normalised graph automorphisms can legitimately
-differ in what they consider equivalent, and the first thing to compare is
-the exchanged-atom sets the record carries, not the numbers.
+Neither is presumed right, and the first thing to compare is the
+exchanged-atom sets the record carries, not the numbers:
+`allowed_mappings.audited_exchanged_atom_sets` against
+`allowed_mappings.implementation_exchanged_atom_sets`, with
+`only_in_the_audited_set` and `only_in_the_implementation_set` naming the
+difference. **Do not reconcile a mismatch by changing the equivalence rule or
+widening the tolerance** — a disagreement is a finding about which convention
+each side implements.
 
 #### What this stage does not establish
 

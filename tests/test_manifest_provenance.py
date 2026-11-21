@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 import chemical_graph as graph_module  # noqa: E402
 import independent_rmsd  # noqa: E402
+import oxygen_pair_audit  # noqa: E402
 import receptor_provenance as provenance  # noqa: E402
 import analyse_redocking  # noqa: E402
 
@@ -548,15 +549,23 @@ class ComparisonRecordTests(unittest.TestCase):
             return value
         return toolkit
 
-    def record(self, rows, equivalence_agree=True):
+    def record(self, rows, mappings_agree=True):
+        audit = {
+            "mapping_sets_agree": mappings_agree,
+            "n_audited_mappings": 2,
+            "n_implementation_mappings": 2 if mappings_agree else 6,
+            "only_in_the_audited_set": [],
+            "only_in_the_implementation_set": (
+                [] if mappings_agree else [[0, 1, 3, 2]]),
+        }
         return independent_rmsd.assemble_record(
             state="minus1", component="LIG",
             inputs={"ligand_manifest": "lig.ligand.json",
                     "ligand_manifest_sha256": "0" * 64},
             protonation_state={"modelled_formal_charge": -1},
             tools={"rdkit": "stub"}, groups=self.groups,
-            equivalence={"agree": equivalence_agree}, rows=rows,
-            plan=self.plan)
+            equivalence={"agree": True}, rows=rows,
+            plan=self.plan, mapping_audit=audit)
 
     def test_an_agreeing_comparison_passes_and_labels_itself_synthetic(self):
         record = self.record(self.rows(self.agreeing_toolkit()))
@@ -614,7 +623,7 @@ class ComparisonRecordTests(unittest.TestCase):
             diagnostic = (3.0 if case.kind == "equivalent_oxygen_swap"
                           else value)
             return {independent_rmsd.SELECTED_VARIANT: value,
-                    independent_rmsd.UNSYMMETRISED_VARIANT: diagnostic}
+                    independent_rmsd.AUTO_SYMMETRISED_VARIANT: diagnostic}
         record = self.record(self.rows(toolkit))
         self.assertEqual(record["result"], "passed", record["failure_reasons"])
         self.assertTrue(record["checks"]["all_cases_agree"])
@@ -631,7 +640,7 @@ class ComparisonRecordTests(unittest.TestCase):
             diagnostic = (0.0 if case.kind in independent_rmsd.NEGATIVE_KINDS
                           else value)
             return {independent_rmsd.SELECTED_VARIANT: value,
-                    independent_rmsd.UNSYMMETRISED_VARIANT: diagnostic}
+                    independent_rmsd.AUTO_SYMMETRISED_VARIANT: diagnostic}
         record = self.record(self.rows(toolkit))
         self.assertEqual(record["result"], "passed", record["failure_reasons"])
         self.assertTrue(record["checks"]["negative_case_distinguished"])
@@ -644,7 +653,12 @@ class ComparisonRecordTests(unittest.TestCase):
         record = self.record(self.rows(self.agreeing_toolkit()))
         selected = record["measure"]["selected_configuration"]
         self.assertEqual(selected["variant"], independent_rmsd.SELECTED_VARIANT)
-        self.assertTrue(selected["symmetrize_conjugated_terminal_groups"])
+        self.assertEqual(selected["variant"],
+                         independent_rmsd.AUDITED_MAP_VARIANT)
+        self.assertFalse(selected["symmetrize_conjugated_terminal_groups"],
+                         "automatic symmetrisation must be off: it accepted "
+                         "the -2 PB swap on real RDKit")
+        self.assertTrue(selected["mappings_supplied_from_the_audit"])
         self.assertIn("intent", selected["selected_on"])
         self.assertIn("only this configuration", selected["binding"])
 
@@ -664,7 +678,7 @@ class ComparisonRecordTests(unittest.TestCase):
                 self.graph, PHOSPHATE_COORDINATES, case.coordinates,
                 self.permutations)
             variants = {independent_rmsd.SELECTED_VARIANT: value,
-                        independent_rmsd.UNSYMMETRISED_VARIANT: value}
+                        independent_rmsd.AUTO_SYMMETRISED_VARIANT: value}
             if case.kind == "protonation_oxygen_swap":
                 variants[independent_rmsd.SELECTED_VARIANT] = 0.0
             return variants
@@ -713,12 +727,23 @@ class ComparisonRecordTests(unittest.TestCase):
         self.assertEqual(record["checks"]["negative_kinds_applicable"],
                          ["element_swap"])
 
-    def test_disagreeing_equivalences_fail_the_record(self):
+    def test_a_mapping_set_mismatch_fails_the_record(self):
+        """Validation 1 is its own gate: the sets must be the same set.
+
+        Comparing orbits is not enough, because two different mapping sets can
+        induce the same orbits. A mismatch means the two sides would minimise
+        over different conventions, so the numbers would not be comparable.
+        """
         record = self.record(self.rows(self.agreeing_toolkit()),
-                             equivalence_agree=False)
+                             mappings_agree=False)
         self.assertEqual(record["result"], "failed")
         self.assertFalse(
-            record["checks"]["equivalences_independently_verified"])
+            record["checks"]["allowed_mappings_independently_audited"])
+        self.assertTrue(any("audited mapping set" in reason
+                            for reason in record["failure_reasons"]))
+        self.assertTrue(any("do not reconcile it by changing the equivalence "
+                            "rule" in reason
+                            for reason in record["failure_reasons"]))
 
 
 class IndependentRmsdPrerequisiteTests(unittest.TestCase):
@@ -746,7 +771,7 @@ class IndependentRmsdPrerequisiteTests(unittest.TestCase):
             "cases": [{"label": "unchanged"}],
             "checks": {"all_cases_agree": True,
                        "negative_case_distinguished": True,
-                       "equivalences_independently_verified": True,
+                       "allowed_mappings_independently_audited": True,
                        "max_absolute_difference_angstrom": 0.0},
         }
         record.update(overrides)
@@ -777,7 +802,7 @@ class IndependentRmsdPrerequisiteTests(unittest.TestCase):
         status = self.validate(self.comparison_record(
             checks={"all_cases_agree": True,
                     "negative_case_distinguished": False,
-                    "equivalences_independently_verified": True}))
+                    "allowed_mappings_independently_audited": True}))
         self.assertFalse(status["satisfied"])
         self.assertIn("negative case", status["reason"])
 
@@ -787,13 +812,14 @@ class IndependentRmsdPrerequisiteTests(unittest.TestCase):
         self.assertFalse(status["satisfied"])
         self.assertIn("different quantity", status["reason"])
 
-    def test_assumed_equivalences_do_not_satisfy_the_prerequisite(self):
+    def test_unaudited_mappings_do_not_satisfy_the_prerequisite(self):
+        """Both sides must minimise over one independently audited set."""
         status = self.validate(self.comparison_record(
             checks={"all_cases_agree": True,
                     "negative_case_distinguished": True,
-                    "equivalences_independently_verified": False}))
+                    "allowed_mappings_independently_audited": False}))
         self.assertFalse(status["satisfied"])
-        self.assertIn("equivalences", status["reason"])
+        self.assertIn("independently audited", status["reason"])
 
     def test_a_record_for_a_different_ligand_does_not_satisfy_it(self):
         write(self.manifest, ligand_manifest(component="ANP"))
@@ -934,12 +960,24 @@ def install_stub_rdkit(molecule, symmetric_permutation):
     import math
     import types
 
-    def calc_rms(probe, reference, symmetrizeConjugatedTerminalGroups=True):
+    def calc_rms(probe, reference, map=None,
+                 symmetrizeConjugatedTerminalGroups=True):
+        """Mirrors the real signature: an explicit `map` overrides perception.
+
+        Given `map`, CalcRMS minimises over exactly those correspondences and
+        perceives nothing itself, which is how the audited convention is
+        handed over. Without it, the hand-declared pair stands in for the
+        toolkit's automatic symmetrisation.
+        """
         first = reference.GetConformer()._positions
         second = probe.GetConformer()._positions
-        candidates = [tuple(range(len(first)))]
-        if symmetrizeConjugatedTerminalGroups:
-            candidates.append(tuple(symmetric_permutation))
+        if map is not None:
+            candidates = [tuple(target for _, target in sorted(entry))
+                          for entry in map]
+        else:
+            candidates = [tuple(range(len(first)))]
+            if symmetrizeConjugatedTerminalGroups:
+                candidates.append(tuple(symmetric_permutation))
         best = None
         for permutation in candidates:
             total = sum(
@@ -1101,23 +1139,26 @@ class ComparisonOrchestrationTests(unittest.TestCase):
                              f"configuration than the record claims binding")
             self.assertIn(selected, row["toolkit_angstrom_by_variant"])
 
-    def test_the_diagnostic_variant_is_recorded_and_not_binding(self):
-        """The unsymmetrised setting disagrees on the justified swap.
+    def test_the_automatic_symmetrisation_result_is_kept_as_a_diagnostic(self):
+        """Retained, recorded, and not binding.
 
-        The stub's CalcRMS minimises over the hand-declared pair only when
-        symmetrising, so the diagnostic setting scores the oxygen separation
-        where this project scores zero. The record must pass on the selected
-        configuration and report the disagreement.
+        On this fixture every terminal-oxygen pair is deprotonated, so the
+        audited convention and automatic symmetrisation happen to coincide and
+        there is nothing to disagree about. What must hold regardless is that
+        the automatic result is still evaluated and recorded as a diagnostic
+        rather than dropped, and that it gates nothing.
         """
         record = self.run_comparison()
         self.assertEqual(record["result"], "passed", record["failure_reasons"])
         diagnostics = record["diagnostics"]
-        self.assertIn(independent_rmsd.UNSYMMETRISED_VARIANT,
+        self.assertIn(independent_rmsd.AUTO_SYMMETRISED_VARIANT,
                       diagnostics["variants"])
-        self.assertGreater(diagnostics["n_disagreements"], 0)
-        self.assertTrue(any(entry["case"].startswith("swap_")
-                            for entry in diagnostics["disagreements"]))
         self.assertIn("not binding", diagnostics["status"])
+        for row in record["cases"]:
+            self.assertIn(independent_rmsd.AUTO_SYMMETRISED_VARIANT,
+                          row["toolkit_angstrom_by_variant"])
+            self.assertNotEqual(row["toolkit_variant_judged"],
+                                independent_rmsd.AUTO_SYMMETRISED_VARIANT)
 
     def test_the_case_set_and_negative_applicability_come_through(self):
         record = self.run_comparison()
@@ -1158,3 +1199,218 @@ class ComparisonOrchestrationTests(unittest.TestCase):
                 cases, {"C1": (0.0, 0.0, 0.0)}, graph, [(0,)],
                 lambda case: {"some_other_variant": 0.0})
         self.assertIn("selected configuration", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Validation 1: the audited mapping convention
+# ---------------------------------------------------------------------------
+
+PHOSPHATE_CCD = """data_PHS
+_chem_comp.id PHS
+_chem_comp.name "two phosphate centres"
+_chem_comp.formula "C H5 O7 P2"
+_chem_comp.pdbx_formal_charge 0
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_aromatic_flag
+_chem_comp_atom.pdbx_stereo_config
+PHS PA P 0 N N
+PHS O1A O 0 N N
+PHS O2A O 0 N N
+PHS O3A O 0 N N
+PHS PB P 0 N N
+PHS O1B O 0 N N
+PHS O2B O 0 N N
+PHS C1 C 0 N N
+PHS HO2A H 0 N N
+PHS HO3A H 0 N N
+PHS HO2B H 0 N N
+PHS H1 H 0 N N
+PHS H1B H 0 N N
+#
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_aromatic_flag
+_chem_comp_bond.pdbx_stereo_config
+PHS PA O1A DOUB N N
+PHS PA O2A SING N N
+PHS PA O3A SING N N
+PHS PA C1 SING N N
+PHS C1 PB SING N N
+PHS PB O1B DOUB N N
+PHS PB O2B SING N N
+PHS O2A HO2A SING N N
+PHS O3A HO3A SING N N
+PHS O2B HO2B SING N N
+PHS C1 H1 SING N N
+PHS C1 H1B SING N N
+#
+"""
+
+
+@unittest.skipUnless(GEMMI_AVAILABLE, "Gemmi is required")
+class OxygenPairAuditTests(unittest.TestCase):
+    """The audited mapping convention, derived without chemical_graph.
+
+    The fixture mirrors UMA's two states in the respect that matters: a centre
+    whose terminal oxygens are all deprotonated, and a centre that retains a
+    proton on one of them. Nothing here validates UMA's chemistry; it checks
+    that the audit applies its stated criteria to named atoms.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        self.ccd = self.root / "PHS.cif"
+        self.ccd.write_text(PHOSPHATE_CCD)
+        self.chemistry = oxygen_pair_audit.read_dictionary_chemistry(self.ccd)
+
+    def test_connectivity_and_hydrogens_are_read_from_the_dictionary(self):
+        self.assertEqual(self.chemistry.identifier, "PHS")
+        self.assertEqual(self.chemistry.heavy_neighbours["O1A"], ("PA",))
+        self.assertEqual(self.chemistry.hydrogens_on["O2B"], ("HO2B",))
+        self.assertNotIn("O1B", self.chemistry.hydrogens_on)
+
+    def test_a_fully_deprotonated_centre_allows_its_pairs(self):
+        """The -3-like case: every terminal oxygen deprotonated."""
+        audit = oxygen_pair_audit.audit_pairs(
+            self.chemistry, ["O2A", "O3A", "O2B"])
+        allowed = [sorted(pair) for pair in audit["allowed_pairs"]]
+        self.assertIn(["O1A", "O2A"], allowed)
+        self.assertIn(["O1B", "O2B"], allowed)
+        self.assertEqual(audit["refused_pairs"], [])
+        self.assertEqual(sorted(audit["exchangeable_groups"]), ["PA", "PB"])
+        self.assertEqual(audit["exchangeable_groups"]["PA"],
+                         ["O1A", "O2A", "O3A"])
+
+    def test_a_retained_proton_refuses_the_pb_pairs(self):
+        """The -2-like case: O2B keeps its proton, so PB's pair is refused.
+
+        This is the exchange automatic CalcRMS symmetrisation accepted on real
+        RDKit at 52dcfef. The audit refuses it on the stated criterion.
+        """
+        audit = oxygen_pair_audit.audit_pairs(self.chemistry, ["O2A", "O3A"])
+        refused = [sorted(pair) for pair in audit["refused_pairs"]]
+        self.assertIn(["O1B", "O2B"], refused)
+        self.assertNotIn("PB", audit["exchangeable_groups"])
+        self.assertIn(["O1A", "O2A"],
+                      [sorted(p) for p in audit["allowed_pairs"]])
+        entry = next(e for e in audit["audited_pairs"]
+                     if sorted(e["pair"]) == ["O1B", "O2B"])
+        self.assertEqual(entry["still_protonated_at_this_state"], ["O2B"])
+        self.assertFalse(
+            entry["conditions"]["neither_bears_a_hydrogen_at_this_state"])
+        self.assertIn("different structure", entry["reason"])
+
+    def test_bond_order_is_recorded_but_is_not_the_criterion(self):
+        """A delocalised group is drawn with one double and one single bond."""
+        audit = oxygen_pair_audit.audit_pairs(
+            self.chemistry, ["O2A", "O3A", "O2B"])
+        entry = next(e for e in audit["audited_pairs"]
+                     if sorted(e["pair"]) == ["O1A", "O2A"])
+        self.assertEqual(sorted(entry["bond_orders_in_the_dictionary"]),
+                         ["DOUB", "SING"])
+        self.assertTrue(entry["exchange_allowed"])
+        self.assertIn("not a criterion", entry["bond_order_note"])
+
+    def test_a_state_deprotonating_an_unprotonated_atom_is_refused(self):
+        with self.assertRaises(oxygen_pair_audit.AuditError):
+            oxygen_pair_audit.audit_pairs(self.chemistry, ["O1A"])
+
+    def test_the_mapping_set_is_built_from_the_audit_alone(self):
+        """PA's three oxygens give 3! orderings, PB's two give 2!."""
+        audit = oxygen_pair_audit.audit_pairs(
+            self.chemistry, ["O2A", "O3A", "O2B"])
+        names = list(self.chemistry.heavy_atom_names)
+        mappings = oxygen_pair_audit.allowed_mappings(audit, names)
+        self.assertEqual(len(mappings), 6 * 2)
+        self.assertEqual(mappings[0], tuple(range(len(names))))
+        self.assertEqual(len(set(mappings)), len(mappings))
+
+    def test_a_refused_group_contributes_no_mapping(self):
+        audit = oxygen_pair_audit.audit_pairs(self.chemistry, ["O2A", "O3A"])
+        names = list(self.chemistry.heavy_atom_names)
+        mappings = oxygen_pair_audit.allowed_mappings(audit, names)
+        self.assertEqual(len(mappings), 6)
+        exchanged = oxygen_pair_audit.exchanged_atom_sets(mappings, names)
+        self.assertFalse(
+            any("O1B" in group or "O2B" in group for group in exchanged),
+            "PB's oxygens must never be exchanged at this state")
+
+
+@unittest.skipUnless(GEMMI_AVAILABLE, "Gemmi is required")
+class AuditedMeasureBehaviourTests(unittest.TestCase):
+    """Required behaviours of the measure under the audited convention.
+
+    Computed with this project's implementation over the audited mapping set.
+    No toolkit is involved, so this establishes nothing about RDKit.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        ccd = self.root / "PHS.cif"
+        ccd.write_text(PHOSPHATE_CCD)
+        self.chemistry = oxygen_pair_audit.read_dictionary_chemistry(ccd)
+        self.names = list(self.chemistry.heavy_atom_names)
+        self.coordinates = {name: PHOSPHATE_COORDINATES[name]
+                            for name in self.names}
+
+    def audited_rmsd(self, deprotonated, pose):
+        """Minimum in-place RMSD over the audited mapping set."""
+        import numpy as np
+        audit = oxygen_pair_audit.audit_pairs(self.chemistry, deprotonated)
+        mappings = oxygen_pair_audit.allowed_mappings(audit, self.names)
+        reference = np.array([self.coordinates[n] for n in self.names])
+        posed = np.array([pose[n] for n in self.names])
+        return min(
+            float(np.sqrt(((reference - posed[list(mapping)]) ** 2)
+                          .sum(1).mean()))
+            for mapping in mappings)
+
+    def swap(self, first, second):
+        posed = dict(self.coordinates)
+        posed[first], posed[second] = self.coordinates[second], self.coordinates[first]
+        return posed
+
+    def test_a_justified_oxygen_swap_gives_zero(self):
+        """Both of PA's and PB's groups fully deprotonated: same structure."""
+        for first, second in (("O1A", "O2A"), ("O1B", "O2B")):
+            value = self.audited_rmsd(["O2A", "O3A", "O2B"],
+                                      self.swap(first, second))
+            self.assertAlmostEqual(value, 0.0, places=9,
+                                   msg=f"{first}/{second}")
+
+    def test_the_minus2_pb_swap_stays_non_zero(self):
+        """O2B keeps its proton, so the exchange is a different structure.
+
+        This is the behaviour automatic CalcRMS symmetrisation violated on
+        real RDKit, scoring 0 A where the measure gives a real displacement.
+        """
+        value = self.audited_rmsd(["O2A", "O3A"], self.swap("O1B", "O2B"))
+        gap = independent_rmsd.separation(self.coordinates, "O1B", "O2B")
+        expected = (2 * gap ** 2 / len(self.names)) ** 0.5
+        self.assertGreater(value, 0.1)
+        self.assertAlmostEqual(value, expected, places=9)
+
+    def test_a_translation_keeps_its_rmsd_without_fitting(self):
+        """No superposition: the full displacement must survive."""
+        for distance in (independent_rmsd.TRANSLATION_SMALL_ANGSTROM,
+                         independent_rmsd.TRANSLATION_LARGE_ANGSTROM):
+            axis = independent_rmsd.TRANSLATION_AXIS
+            scale = distance / sum(c ** 2 for c in axis) ** 0.5
+            posed = {name: (x + axis[0] * scale, y + axis[1] * scale,
+                            z + axis[2] * scale)
+                     for name, (x, y, z) in self.coordinates.items()}
+            for deprotonated in (["O2A", "O3A", "O2B"], ["O2A", "O3A"]):
+                value = self.audited_rmsd(deprotonated, posed)
+                self.assertAlmostEqual(value, distance, places=9,
+                                       msg=f"{distance} A, {deprotonated}")
