@@ -1,0 +1,138 @@
+# UMA pose comparison in the crystallographic receptor frame.
+#
+# Run from inside a viewing bundle directory:
+#     chimerax examples/uma_pose_comparison.cxc
+# or, from the ChimeraX command line:
+#     cd /path/to/bundle
+#     open uma_pose_comparison.cxc
+#
+# Expected bundle layout, all paths relative to the bundle root:
+#   1P3D.cif                     deposited structure, unmodified
+#   receptor_prepared.pdb        the prepared docking receptor
+#   uma_deposited.pdb            from pose_to_pdb.py
+#   uma_rank1.pdb                from pose_to_pdb.py
+#   uma_rank7.pdb                from pose_to_pdb.py
+#   uma_minimised.pdb            from pose_to_pdb.py
+#   box_30A.bild                 from box_to_bild.py
+#
+# EVERY structure is already in the deposited coordinate frame. There is no
+# `align`, `matchmaker`, `fitmap` or `view matrix` command anywhere in this
+# file, and none must be added: superposing the ligand poses would destroy the
+# measurement the comparison exists to make.
+
+close session
+set bgColor white
+
+# ---------------------------------------------------------------------------
+# 1. Deposited structure, as experimental context only
+# ---------------------------------------------------------------------------
+open 1P3D.cif
+rename #1 deposited
+hide #1 atoms
+hide #1 cartoons
+# Chain A is the protein copy the box and receptor were built from.
+show #1/A cartoons
+color #1/A gray(200) cartoons
+transparency #1/A 40 cartoons
+
+# Cofactors and metals: present in the crystal, ABSENT from the docking
+# receptor. Shown so their vacated space is visible, not as components of the
+# model that produced the poses.
+show #1/A:ANP atoms
+style #1/A:ANP stick
+color #1/A:ANP medium purple
+show #1/A:MN atoms
+style #1/A:MN sphere
+color #1/A:MN goldenrod
+name cofactors #1/A:ANP,MN
+
+# First-shell waters within 3.5 A of the deposited ligand. Also absent from
+# the docking receptor.
+show #1/A:HOH atoms
+style #1/A:HOH sphere
+size #1/A:HOH atomRadius 0.25
+color #1/A:HOH sky blue
+name shellwaters #1/A:HOH & #1/A:UMA :< 3.5
+
+# The deposited UMA inside the full structure is hidden; the converted,
+# atom-mapped copy opened below is the one to compare against.
+hide #1/A:UMA atoms
+
+# ---------------------------------------------------------------------------
+# 2. The prepared docking receptor: what Vina actually scored against
+# ---------------------------------------------------------------------------
+open receptor_prepared.pdb
+rename #2 receptor
+hide #2 atoms
+show #2 cartoons
+color #2 dark gray cartoons
+hide #2 models
+
+# ---------------------------------------------------------------------------
+# 3. The four ligand poses. Colours are fixed so figures stay comparable.
+# ---------------------------------------------------------------------------
+open uma_deposited.pdb
+rename #3 uma_deposited
+open uma_rank1.pdb
+rename #4 uma_rank1
+open uma_rank7.pdb
+rename #5 uma_rank7
+open uma_minimised.pdb
+rename #6 uma_minimised
+
+style #3-6 stick
+size #3-6 stickRadius 0.18
+
+color #3 green            # deposited: the answer
+color #4 red              # rank 1: best score, wrong pose
+color #5 orange           # rank 7: closest retained pose
+color #6 cornflower blue  # locally minimised deposited pose
+
+# ---------------------------------------------------------------------------
+# 4. The recorded search box
+# ---------------------------------------------------------------------------
+open box_30A.bild
+rename #7 box_30A
+
+# ---------------------------------------------------------------------------
+# 5. Pocket context, by author residue number on author chain A
+# ---------------------------------------------------------------------------
+name pocket #2/A:25,27-32,48-51,70,84-88,91,107,152,173-175,177,178,198,346,348,376,377,380,459
+show pocket atoms
+style pocket stick
+size pocket stickRadius 0.08
+color pocket tan
+
+# ---------------------------------------------------------------------------
+# 6. View, centred on the deposited ligand
+# ---------------------------------------------------------------------------
+view #3
+zoom 0.85
+lighting soft
+graphics silhouettes true width 1.2
+
+# ---------------------------------------------------------------------------
+# Toggles. Run any of these at the ChimeraX prompt after the file loads.
+# ---------------------------------------------------------------------------
+#   hide cofactors atoms      /  show cofactors atoms
+#   hide shellwaters atoms    /  show shellwaters atoms
+#   hide #1 models            /  show #1 models      deposited structure
+#   show #2 models            /  hide #2 models      prepared receptor
+#   hide #7 models            /  show #7 models      search box
+#   surface #2/A enclose #2/A ; transparency #2 60 surfaces
+#   hide #4 models            leave only deposited, rank 7 and minimised
+#
+# Per-fragment inspection of UMA, by CCD atom name:
+#   name uridine   #3-6@N1,C2,O2,N3,C4,O4,C5,C6,C1B,C2B,O2',C3B,O3B,C4B,O4B,C5B,O5B
+#   name diphos    #3-6@PA,O1A,O2A,O3A,PB,O1B,O2B,O1'
+#   name muramyl   #3-6@C1',C2',N2',C3',O3',C4',O4',C5',C6',O6',C7',O7',C8'
+#   name alanine   #3-6@C18,C19,O19,N4,C21,C22,O20,O21,C23
+# Then, for example:
+#   hide #3-6 atoms ; show diphos atoms
+#
+# Distances are measured explicitly, never inferred from proximity alone:
+#   distance #3@O2B #2/A:107@NH1
+# A short contact is not a hydrogen bond. For candidate hydrogen bonds with
+# geometry taken into account, use ChimeraX's own criteria:
+#   hbonds #5 restrict #2 reveal true
+# and treat the result as a hypothesis to inspect, not a count to report.
