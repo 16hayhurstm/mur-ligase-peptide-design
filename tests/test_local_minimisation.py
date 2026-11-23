@@ -39,6 +39,12 @@ def write(path: Path, payload) -> None:
     Path(path).write_text(json.dumps(payload, indent=2) + "\n")
 
 
+# Slot holding the unbound reference in Vina's score() array. Duplicated here
+# as a plain constant rather than imported, so this module does not depend on
+# the rescoring module it is also a fixture for.
+REFERENCE_INDEX = 7
+
+
 class StubVina:
     """A deterministic stand-in for `vina.Vina`.
 
@@ -67,9 +73,38 @@ class StubVina:
     def compute_vina_maps(self, center, box_size):
         self.maps = (list(center), list(box_size))
 
-    def score(self):
-        """Stub score. Components: total, inter, intra (stub labels)."""
-        return list(StubVina.before)
+    # Stub internal energies, keyed on the ligand file's stem, so a test can
+    # give two poses different internal strain and see the two reference
+    # conventions diverge exactly as Vina's do.
+    internal_energy: dict[str, float] = {}
+    default_internal = 1.0
+    # conf_independent divisor, 1 + w * N_rot. A fixed stub value: the real
+    # one depends on the ligand's rotatable-bond count.
+    conf_divisor = 2.0
+
+    def _internal(self):
+        stem = self.ligand_path.stem if self.ligand_path else ""
+        return StubVina.internal_energy.get(stem, StubVina.default_internal)
+
+    def score(self, unbound_energy=None):
+        """Stub score. Mirrors Vina's reference-energy arithmetic.
+
+        total = (inter + intra - reference) / conf_divisor, with the reference
+        defaulting to this pose's own internal energy, and component 7 holding
+        the reference actually used, as v1.2.7 does.
+        """
+        if len(StubVina.before) <= REFERENCE_INDEX:
+            # Short form used by the minimisation tests, which do not exercise
+            # the reference conventions at all.
+            return list(StubVina.before)
+        inter, intra = StubVina.before[1], self._internal()
+        reference = self._internal() if unbound_energy is None else unbound_energy
+        total = (inter + intra - reference) / StubVina.conf_divisor
+        components = list(StubVina.before)
+        components[0] = round(total, 3)
+        components[5] = intra
+        components[REFERENCE_INDEX] = reference
+        return components
 
     def optimize(self, max_steps=0):
         self.max_steps = max_steps

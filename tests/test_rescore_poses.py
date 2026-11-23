@@ -23,8 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rescore_poses as rescore  # noqa: E402
 import receptor_provenance as provenance  # noqa: E402
-from test_local_minimisation import (DiagnosticFixture, StubVina,  # noqa: E402
-                                     write)
+from test_local_minimisation import (DiagnosticFixture, REFERENCE_INDEX,  # noqa: E402
+                                     StubVina, write)
+
+# An eight-component stub array, so the reference-energy slots exist. Index 1
+# is the intermolecular term the stub uses; index 7 is overwritten with the
+# reference actually applied.
+EIGHT_COMPONENTS = [0.0, -20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def pose_block(coordinates, affinity, offset=0.0, torsdof=2):
@@ -48,6 +53,10 @@ class ExtractionFixture(DiagnosticFixture):
 
     def setUp(self):
         super().setUp()
+        StubVina.before = list(EIGHT_COMPONENTS)
+        StubVina.internal_energy = {}
+        StubVina.default_internal = 1.0
+        StubVina.conf_divisor = 2.0
         self.affinities = (-9.33, -9.25, -9.16)
         self.offsets = (0.0, 0.5, 1.25)
         blocks = [pose_block(self.coordinates, affinity, offset)
@@ -72,6 +81,7 @@ class ExtractionFixture(DiagnosticFixture):
             atom_map=self.atom_map,
             preparation_record=self.preparation,
             stereo_verification=self.verification,
+            reference_pose="docked_rank_1",
             cpu=2, seed=1, check_only=False,
         )
         values.update(overrides)
@@ -147,28 +157,119 @@ class ExtractionTests(ExtractionFixture):
             rescore.split_models(empty)
 
 
-class ConventionProbeTests(unittest.TestCase):
-    """The totals must not be compared until the convention is established."""
+class AffinityReproductionTests(unittest.TestCase):
+    """Replaces the earlier convention probe, whose inference was wrong.
 
-    def test_a_matching_component_is_identified(self):
-        probe = rescore.convention_probe([-9.33, -10.5, 1.2], -9.33)
-        self.assertEqual(probe["matching_component_indices"], [0])
-        self.assertIn("reproduce the affinity", probe["interpretation"])
+    A score() component that does not match the recorded affinity is *not*
+    evidence of a different reference convention. Both totals come from the
+    same formula and differ only in which internal energy was supplied as the
+    reference. The test is whether supplying the docking run's reference
+    reproduces its affinity.
+    """
 
-    def test_a_match_on_a_later_component_is_identified(self):
-        probe = rescore.convention_probe([-11.0, -9.16, 1.8], -9.16)
-        self.assertEqual(probe["matching_component_indices"], [1])
+    def test_agreement_within_tolerance_is_reported_as_reproduced(self):
+        check = rescore.affinity_reproduction(-9.331, -9.329)
+        self.assertTrue(check["reproduced"])
+        self.assertAlmostEqual(check["residual_kcal_per_mol"], -0.002, places=6)
+        self.assertIn("rounded to three decimals", check["tolerance_basis"])
 
-    def test_no_match_is_reported_as_a_convention_difference(self):
-        probe = rescore.convention_probe([-11.0, -12.4, 1.8], -9.16)
-        self.assertEqual(probe["matching_component_indices"], [])
-        self.assertIn("different reference conventions", probe["interpretation"])
-        self.assertAlmostEqual(probe["difference_from_component_0"], -1.84,
-                               places=6)
+    def test_a_large_residual_is_reported_as_not_reproduced(self):
+        check = rescore.affinity_reproduction(-9.801, -9.161)
+        self.assertFalse(check["reproduced"])
+        self.assertAlmostEqual(check["residual_kcal_per_mol"], -0.640, places=6)
 
-    def test_a_pose_without_a_recorded_affinity_is_not_compared(self):
-        probe = rescore.convention_probe([-9.0], None)
-        self.assertFalse(probe["comparable"])
+    def test_a_pose_without_a_recorded_affinity_is_not_checked(self):
+        check = rescore.affinity_reproduction(-9.0, None)
+        self.assertFalse(check["checked"])
+        self.assertIn("no recorded affinity", check["reason"])
+
+    def test_no_common_reference_score_means_no_check(self):
+        check = rescore.affinity_reproduction(None, -9.161)
+        self.assertFalse(check["checked"])
+
+    def test_the_docstring_records_the_corrected_interpretation(self):
+        text = rescore.affinity_reproduction.__doc__
+        self.assertIn("That inference was wrong", text)
+        self.assertIn("not evidence of a different convention", text)
+
+
+class ReferenceConventionTests(ExtractionFixture):
+    """The distinction the two conventions make, and why ranking can flip."""
+
+    def setUp(self):
+        super().setUp()
+        # Rank 3 is internally strained relative to rank 1 by 1.0 kcal/mol,
+        # the situation that demoted the near-native pose in the real run.
+        StubVina.internal_energy = {"rank_1": 1.0, "rank_3": 2.0, "lig": 1.5}
+
+    def test_the_reference_slot_is_confirmed_before_use(self):
+        record = rescore.run(self.arguments())
+        confirmation = record["reference_energy"]["confirmation"]
+        self.assertEqual(confirmation["component_index"], REFERENCE_INDEX)
+        self.assertIn("reproduced the same total", confirmation["confirmed_by"])
+        self.assertAlmostEqual(confirmation["total_without_argument"],
+                               confirmation["total_with_argument"], places=6)
+
+    def test_an_unconfirmable_reference_slot_aborts(self):
+        """If slot 7 is not the reference, nothing may be interpreted."""
+        class Wrong(StubVina):
+            def score(self, unbound_energy=None):
+                components = list(EIGHT_COMPONENTS)
+                components[0] = -5.0 if unbound_energy is None else -99.0
+                return components
+        sys.modules["vina"].Vina = Wrong
+        self.addCleanup(setattr, sys.modules["vina"], "Vina", StubVina)
+        with self.assertRaises(rescore.RescoringError) as caught:
+            rescore.run(self.arguments())
+        self.assertIn("is not the unbound reference", str(caught.exception))
+
+    def test_the_reference_pose_scores_identically_under_both_conventions(self):
+        """Its own reference *is* the shared one, so the two must agree."""
+        record = rescore.run(self.arguments())
+        row = next(r for r in record["poses"] if r["label"] == "docked_rank_1")
+        specific = row["scores"]["pose_specific"]["total_kcal_per_mol"]
+        shared = row["scores"]["common_reference"]["total_kcal_per_mol"]
+        self.assertAlmostEqual(specific, shared, places=6)
+
+    def test_a_strained_pose_diverges_between_the_conventions(self):
+        record = rescore.run(self.arguments())
+        row = next(r for r in record["poses"] if r["label"] == "docked_rank_3")
+        specific = row["scores"]["pose_specific"]["total_kcal_per_mol"]
+        shared = row["scores"]["common_reference"]["total_kcal_per_mol"]
+        # strain 2.0 against reference 1.0, over conf_divisor 2.0
+        self.assertAlmostEqual(shared - specific, 0.5, places=6)
+        self.assertLess(specific, shared,
+                        "the pose-specific total must be the more favourable "
+                        "one when the pose is internally strained")
+
+    def test_both_methods_are_retained_and_labelled(self):
+        record = rescore.run(self.arguments())
+        for row in record["poses"]:
+            self.assertEqual(row["scores"]["pose_specific"]["method"],
+                             "pose_specific")
+            self.assertEqual(row["scores"]["common_reference"]["method"],
+                             "common_reference")
+        self.assertIn("neither_is_more_correct", record["scoring_methods"])
+        self.assertIn("v1.2.7", record["scoring_methods"]["source"])
+
+    def test_the_reference_must_come_from_a_requested_pose(self):
+        with self.assertRaises(rescore.RescoringError) as caught:
+            rescore.run(self.arguments(reference_pose="docked_rank_99"))
+        self.assertIn("is not among the poses requested", str(caught.exception))
+
+    def test_the_crystal_poses_are_scored_under_the_shared_reference_too(self):
+        record = rescore.run(self.arguments())
+        row = next(r for r in record["poses"] if r["label"] == "deposited")
+        self.assertIn("common_reference", row["scores"])
+        self.assertEqual(
+            row["scores"]["common_reference"]["reference_kcal_per_mol"],
+            record["reference_energy"]["reference_kcal_per_mol"])
+
+    def test_the_uncertainty_note_no_longer_sets_a_ranking_threshold(self):
+        record = rescore.run(self.arguments())
+        note = record["uncertainty_note"]
+        self.assertIn("NOT a calibrated threshold", note)
+        self.assertIn("across different ligands", note)
 
 
 class RescoringRunTests(ExtractionFixture):
@@ -178,8 +279,9 @@ class RescoringRunTests(ExtractionFixture):
         self.assertEqual(len(record["poses"]), 3)
         labels = [row["label"] for row in record["poses"]]
         self.assertEqual(labels, ["deposited", "docked_rank_1", "docked_rank_3"])
-        # One freshly built engine per pose, same receptor/box for each.
-        self.assertEqual(len(StubVina.instances), 3)
+        # One engine per pose, plus one built earlier to establish and
+        # confirm the shared unbound reference.
+        self.assertEqual(len(StubVina.instances), 4)
         boxes = {tuple(engine.maps[0] + engine.maps[1])
                  for engine in StubVina.instances}
         self.assertEqual(len(boxes), 1, "every pose must share one box setup")
@@ -193,13 +295,15 @@ class RescoringRunTests(ExtractionFixture):
                 if not line.startswith("ATOM") or " O1 " not in line]
         truncated.write_text("\n".join(keep) + "\n")
         with self.assertRaises(Exception) as caught:
-            rescore.run(self.arguments(deposited=truncated, docked_rank=[]))
+            rescore.run(self.arguments(deposited=truncated, docked_rank=[],
+                                       reference_pose="deposited"))
         self.assertRegex(str(caught.exception), "O1|heavy atom")
 
     def test_rmsd_is_measured_without_superposition(self):
         """Rank 3 is a rigid 1.25 A shift along x and must read as such."""
         record = rescore.run(self.arguments(docked_rank=[f"3:{self.docked}"],
-                                           deposited=None))
+                                           deposited=None,
+                                           reference_pose="docked_rank_3"))
         row = record["poses"][0]
         self.assertAlmostEqual(row["rmsd_to_deposited_angstrom"], 1.25, places=3)
         self.assertEqual(record["measure"]["superposition"], "none")
@@ -210,9 +314,10 @@ class RescoringRunTests(ExtractionFixture):
         self.assertFalse(record["experiment"]["poses_were_modified"])
         self.assertFalse(record["experiment"]["counts_towards_2A_positive_control"])
 
-    def test_the_uncertainty_note_is_recorded(self):
+    def test_the_source_of_the_scoring_conventions_is_recorded(self):
         record = rescore.run(self.arguments())
-        self.assertIn("2.85", record["uncertainty_note"])
+        self.assertIn("vina.cpp", record["scoring_methods"]["source"])
+        self.assertIn("unbound_energy", record["scoring_methods"]["source"])
 
     def test_check_only_validates_without_scoring(self):
         record = rescore.run(self.arguments(check_only=True))
@@ -227,7 +332,8 @@ class RescoringRunTests(ExtractionFixture):
         outside = self.root / "far.pdbqt"
         outside.write_text("\n".join(pose_block(far, -9.0)) + "\n")
         with self.assertRaises(rescore.RescoringError) as caught:
-            rescore.run(self.arguments(deposited=outside, docked_rank=[]))
+            rescore.run(self.arguments(deposited=outside, docked_rank=[],
+                                       reference_pose="deposited"))
         self.assertIn("inside the recorded box", str(caught.exception))
 
     def test_the_provenance_chain_is_enforced_for_rescoring_too(self):

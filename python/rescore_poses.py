@@ -64,11 +64,48 @@ import ligand_atom_map
 import local_minimisation as diagnostic
 import receptor_provenance as provenance
 
-SCHEMA = "mur-ligase-pose-rescoring/1"
+SCHEMA = "mur-ligase-pose-rescoring/2"
 
-# Vina's own reported error on its validation set. A difference smaller than
-# this does not establish a preference between two poses.
-VINA_SCORE_UNCERTAINTY_KCAL = 2.85
+# Component order of the array returned by Vina::score(), read from
+# AutoDock Vina v1.2.7, src/lib/vina.cpp. Two namings exist for the same eight
+# slots: the order the C++ pushes them, and the Python binding's docstring.
+# They disagree over the names of slots 2-4, so both are recorded and nothing
+# in this analysis depends on either. Slot 7 is the unbound reference in both
+# accounts, and it is confirmed empirically before use; see
+# `confirm_reference_index`.
+SCORE_LABELS_CPP = (
+    "total", "lig_grids", "inter_pairs", "flex_grids",
+    "intra_pairs", "lig_intra", "conf_independent", "unbound_reference",
+)
+SCORE_LABELS_PYTHON_DOCSTRING = (
+    "total", "lig_inter", "flex_inter", "other_inter",
+    "flex_intra", "lig_intra", "torsions", "lig_intra_best_pose",
+)
+UNBOUND_REFERENCE_INDEX = 7
+
+# For Vina and Vinardo, `Vina::score()` with no argument computes the unbound
+# reference from the pose in hand:
+#     intramolecular_energy = m_model.eval_intramolecular(...)
+#     total = conf_independent(model, inter + intra - intramolecular_energy)
+# `Vina::global_search()` instead sets the model to poses[0] and takes one
+# reference from it -- the source comment reads "we take the intramolecular
+# energy from the best pose" -- then passes that single value to score() for
+# every retained pose. So a docking run reports each pose against the best
+# pose's internal energy, while standalone score() reports each pose against
+# its own. The two agree for the best pose and diverge for every other, by
+# exactly the internal-energy difference carried through conf_independent.
+SOURCE_REFERENCE = (
+    "AutoDock Vina v1.2.7, src/lib/vina.cpp: Vina::score() and "
+    "Vina::global_search(); Python binding Vina.score(unbound_energy=None)"
+)
+
+# Both the stored REMARK VINA RESULT and the Python binding's score() are
+# rounded to three decimals, so two independently rounded values may differ by
+# up to 0.001 before any arithmetic. Affinity maps are also recomputed here
+# rather than reused, which admits a small interpolation difference. 0.01
+# kcal/mol absorbs both and is still far tighter than any energy difference
+# this analysis interprets.
+AFFINITY_TOLERANCE_KCAL = 0.01
 
 
 class RescoringError(RuntimeError):
@@ -173,9 +210,9 @@ def extract_pose(source: Path, rank: int, destination: Path) -> dict[str, object
 # Scoring, one setup for every pose
 # ---------------------------------------------------------------------------
 
-def score_one_pose(pose_path: Path, receptor: Path, centre, size,
-                   cpu: int, seed: int) -> dict[str, object]:
-    """Score one pose with a freshly built engine and identical settings.
+def build_engine(pose_path: Path, receptor: Path, centre, size,
+                 cpu: int, seed: int):
+    """Return a Vina engine loaded with one pose, maps computed.
 
     A new engine per pose, rather than one engine reused, so that no pose can
     inherit map or ligand state from the pose before it. The settings are
@@ -189,39 +226,121 @@ def score_one_pose(pose_path: Path, receptor: Path, centre, size,
     engine.set_ligand_from_file(str(pose_path))
     engine.compute_vina_maps(center=[float(value) for value in centre],
                              box_size=[float(value) for value in size])
-    return diagnostic.score_components(engine, engine.score())
+    return engine
 
 
-def convention_probe(components: list[float], affinity: float | None,
-                     tolerance: float = 0.005) -> dict[str, object]:
-    """Say which score() component reproduces the recorded docking affinity.
+def confirm_reference_index(engine) -> dict[str, object]:
+    """Confirm empirically which component holds the unbound reference.
 
-    Vina's reporting convention for a search result is not guaranteed to be
-    component 0 of `score()`. Rather than assume, every component is compared
-    with the affinity the pose file records, and the matching indices are
-    reported. An empty list is itself informative: it means the two quantities
-    are on different reference conventions and must not be compared directly.
+    The labels published for `score()`'s array disagree over some slots, so the
+    slot this analysis depends on is established by experiment rather than
+    read off a docstring. `score()` with no argument computes a pose-specific
+    reference and returns it in some slot; passing that exact value back as
+    `unbound_energy` must then reproduce the identical total. If it does, the
+    slot is the reference, on this build, for this pose.
+
+    Raises if the identity does not hold, because every common-reference score
+    below would otherwise be computed from the wrong quantity.
+    """
+    native = [float(value) for value in np.atleast_1d(np.asarray(
+        engine.score(), float))]
+    if len(native) <= UNBOUND_REFERENCE_INDEX:
+        raise RescoringError(
+            f"score() returned {len(native)} components; index "
+            f"{UNBOUND_REFERENCE_INDEX} was expected to hold the unbound "
+            f"reference. {SOURCE_REFERENCE}")
+    candidate = native[UNBOUND_REFERENCE_INDEX]
+    echoed = [float(value) for value in np.atleast_1d(np.asarray(
+        engine.score(unbound_energy=candidate), float))]
+    agrees = abs(echoed[0] - native[0]) <= AFFINITY_TOLERANCE_KCAL
+    if not agrees:
+        raise RescoringError(
+            f"passing component {UNBOUND_REFERENCE_INDEX} "
+            f"({candidate}) back as unbound_energy changed the total from "
+            f"{native[0]} to {echoed[0]}, so that component is not the "
+            f"unbound reference on this build. Re-read {SOURCE_REFERENCE} "
+            f"before interpreting any common-reference score.")
+    return {
+        "component_index": UNBOUND_REFERENCE_INDEX,
+        "pose_specific_reference_kcal_per_mol": candidate,
+        "confirmed_by": ("passing the component back as unbound_energy "
+                         "reproduced the same total"),
+        "total_without_argument": native[0],
+        "total_with_argument": echoed[0],
+        "source": SOURCE_REFERENCE,
+    }
+
+
+def score_both_conventions(engine, common_reference: float | None
+                           ) -> dict[str, object]:
+    """Score one pose pose-specifically and, if given, against one reference.
+
+    Two explicitly labelled methods, both retained:
+
+    `pose_specific` is `score()` with no argument: each pose is measured
+    against its own internal energy, so the total reflects intermolecular
+    complementarity and the torsional term, with internal strain cancelled.
+
+    `common_reference` is `score(unbound_energy=R)` for one shared R: every
+    pose is measured against the same internal-energy zero, so a pose that is
+    internally strained relative to that zero is charged for it. This is the
+    convention a docking run reports.
+
+    Neither is more correct. They answer different questions, and a pose can
+    rank differently under each -- which is the point of recording both.
+    """
+    pose_specific = diagnostic.score_components(engine, engine.score())
+    pose_specific["method"] = "pose_specific"
+    pose_specific["method_note"] = (
+        "score() with no argument; reference is this pose's own internal "
+        "energy, so internal strain cancels")
+    result = {"pose_specific": pose_specific}
+    if common_reference is not None:
+        shared = diagnostic.score_components(
+            engine, engine.score(unbound_energy=float(common_reference)))
+        shared["method"] = "common_reference"
+        shared["method_note"] = (
+            f"score(unbound_energy={common_reference}); every pose measured "
+            f"against one shared internal-energy zero, as a docking run "
+            f"reports")
+        shared["reference_kcal_per_mol"] = float(common_reference)
+        result["common_reference"] = shared
+    return result
+
+
+def affinity_reproduction(common_total: float | None, affinity: float | None,
+                          tolerance: float = AFFINITY_TOLERANCE_KCAL
+                          ) -> dict[str, object]:
+    """Check whether the common-reference total reproduces what docking recorded.
+
+    This replaces an earlier check that scanned every component for one
+    matching the recorded affinity and, finding none, concluded the two used
+    different reference conventions. **That inference was wrong.** A
+    non-matching component is not evidence of a different convention: the
+    totals are computed by the same formula and differ only in which internal
+    energy was supplied as the reference. Supplying the reference the docking
+    run used is what makes them comparable, and whether they then agree is the
+    actual test.
     """
     if affinity is None:
-        return {"comparable": False,
-                "reason": "the pose file records no REMARK VINA RESULT"}
-    matches = [index for index, value in enumerate(components)
-               if abs(value - affinity) <= tolerance]
+        return {"checked": False,
+                "reason": "the pose file records no REMARK VINA RESULT, so "
+                          "there is no recorded affinity to reproduce"}
+    if common_total is None:
+        return {"checked": False,
+                "reason": "no common-reference score was computed"}
+    residual = common_total - affinity
     return {
-        "comparable": True,
+        "checked": True,
         "recorded_affinity_kcal_per_mol": affinity,
+        "common_reference_total_kcal_per_mol": common_total,
+        "residual_kcal_per_mol": round(residual, 6),
         "tolerance_kcal_per_mol": tolerance,
-        "matching_component_indices": matches,
-        "difference_from_component_0": (
-            None if not components else round(components[0] - affinity, 6)),
-        "interpretation": (
-            f"score() component(s) {matches} reproduce the affinity Vina "
-            f"recorded during docking, so that component is the matched "
-            f"quantity for comparison"
-            if matches else
-            "no score() component reproduces the recorded docking affinity, "
-            "so score() and energies() use different reference conventions "
-            "here; compare the separated components, never the totals"),
+        "reproduced": abs(residual) <= tolerance,
+        "tolerance_basis": (
+            "both quantities are rounded to three decimals by the Python "
+            "binding, and the affinity maps are recomputed rather than "
+            "reused"),
     }
 
 
@@ -297,6 +416,38 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         diagnostic.protonation_aware_symmetry(component, ligand_manifest)
 
     poses = requested_poses(args, output_dir)
+
+    # The shared internal-energy zero comes from one named pose, so every
+    # common-reference score below is on the same footing as the docking run
+    # that reported that pose first.
+    reference_detail: dict[str, object] = {
+        "requested_label": args.reference_pose,
+        "established": False,
+    }
+    common_reference: float | None = None
+    if not args.check_only:
+        chosen = [pose for pose in poses if pose["label"] == args.reference_pose]
+        if not chosen:
+            raise RescoringError(
+                f"--reference-pose {args.reference_pose!r} is not among the "
+                f"poses requested ({[p['label'] for p in poses]}); the common "
+                f"reference must come from a pose being scored")
+        engine = build_engine(chosen[0]["path"], args.receptor, centre, size,
+                              args.cpu, args.seed)
+        confirmation = confirm_reference_index(engine)
+        common_reference = confirmation["pose_specific_reference_kcal_per_mol"]
+        reference_detail = {
+            "requested_label": args.reference_pose,
+            "established": True,
+            "reference_kcal_per_mol": common_reference,
+            "taken_from_pose": chosen[0]["label"],
+            "confirmation": confirmation,
+            "why": (
+                "a docking run takes one internal-energy reference from its "
+                "best pose and reports every retained pose against it, so "
+                "reproducing those affinities requires that same reference"),
+        }
+
     rows: list[dict[str, object]] = []
     for pose in poses:
         coordinates = diagnostic.pose_from_pdbqt(pose["path"], names_by_serial)
@@ -323,11 +474,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "permutation_used": list(permutation),
         }
         if not args.check_only:
-            scored = score_one_pose(pose["path"], args.receptor, centre, size,
-                                    args.cpu, args.seed)
-            row["score"] = scored
-            row["convention_probe"] = convention_probe(
-                scored["raw_components"],
+            engine = build_engine(pose["path"], args.receptor, centre, size,
+                                  args.cpu, args.seed)
+            scored = score_both_conventions(engine, common_reference)
+            row["scores"] = scored
+            row["affinity_reproduction"] = affinity_reproduction(
+                (scored.get("common_reference") or {}).get("total_kcal_per_mol"),
                 pose["provenance"].get("recorded_affinity_kcal_per_mol"))
         rows.append(row)
 
@@ -381,10 +533,37 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "n_automorphisms": len(permutations),
             "resonance_normalisation": resonance,
         },
+        "scoring_methods": {
+            "pose_specific": (
+                "score() with no argument; each pose against its own internal "
+                "energy, so internal strain cancels and the total reflects "
+                "intermolecular complementarity and the torsional term"),
+            "common_reference": (
+                "score(unbound_energy=R) for one shared R taken from the "
+                "reference pose; the convention a docking run reports, in "
+                "which a pose internally strained relative to R is charged "
+                "for that strain"),
+            "neither_is_more_correct": (
+                "they answer different questions, and a pose may rank "
+                "differently under each; both are retained and labelled"),
+            "source": SOURCE_REFERENCE,
+            "component_labels_cpp_push_order": list(SCORE_LABELS_CPP),
+            "component_labels_python_docstring": list(
+                SCORE_LABELS_PYTHON_DOCSTRING),
+            "component_label_caveat": (
+                "the two published namings disagree over slots 2-4; nothing "
+                "here depends on them, and slot 7 is confirmed empirically"),
+        },
+        "reference_energy": reference_detail,
         "uncertainty_note": (
-            f"Vina's reported error on its own validation set is roughly "
-            f"{VINA_SCORE_UNCERTAINTY_KCAL} kcal/mol. Differences smaller "
-            f"than that do not establish a preference between poses."),
+            "Vina's ~2-3 kcal/mol error is a validation figure for predicting "
+            "absolute affinities across different ligands. It is NOT a "
+            "calibrated threshold for ranking poses of one ligand in one "
+            "receptor, where systematic terms largely cancel, and it must not "
+            "be used to dismiss a within-ligand difference. How small a "
+            "within-ligand gap is meaningful is not established here; report "
+            "the differences and their components rather than declaring a "
+            "winner."),
         "poses": rows,
         "result": "checks_passed_nothing_scored" if args.check_only else "completed",
     }
@@ -401,20 +580,31 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 def write_table(path: Path, rows: list[dict[str, object]]) -> None:
     """Write the compact comparison table as CSV."""
     fields = ["label", "rank_in_file", "rmsd_to_deposited_angstrom",
-              "recorded_affinity_kcal_per_mol", "score_total_kcal_per_mol",
-              "n_heavy_atoms_mapped"]
+              "recorded_docking_affinity", "pose_specific_total",
+              "common_reference_total", "unbound_reference",
+              "affinity_residual", "reproduced", "n_heavy_atoms_mapped"]
     with Path(path).open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
+            scores = row.get("scores", {}) or {}
+            specific = scores.get("pose_specific", {}) or {}
+            shared = scores.get("common_reference", {}) or {}
+            reproduction = row.get("affinity_reproduction", {}) or {}
+            components = specific.get("raw_components") or []
             writer.writerow({
                 "label": row["label"],
                 "rank_in_file": row["provenance"].get("rank_in_file"),
                 "rmsd_to_deposited_angstrom": row["rmsd_to_deposited_angstrom"],
-                "recorded_affinity_kcal_per_mol": row["provenance"].get(
+                "recorded_docking_affinity": row["provenance"].get(
                     "recorded_affinity_kcal_per_mol"),
-                "score_total_kcal_per_mol": (
-                    row.get("score", {}) or {}).get("total_kcal_per_mol"),
+                "pose_specific_total": specific.get("total_kcal_per_mol"),
+                "common_reference_total": shared.get("total_kcal_per_mol"),
+                "unbound_reference": (
+                    components[UNBOUND_REFERENCE_INDEX]
+                    if len(components) > UNBOUND_REFERENCE_INDEX else None),
+                "affinity_residual": reproduction.get("residual_kcal_per_mol"),
+                "reproduced": reproduction.get("reproduced"),
                 "n_heavy_atoms_mapped": row["n_heavy_atoms_mapped"],
             })
 
@@ -442,6 +632,10 @@ def main() -> None:
     parser.add_argument("--atom-map", type=Path, required=True)
     parser.add_argument("--preparation-record", type=Path, required=True)
     parser.add_argument("--stereo-verification", type=Path, default=None)
+    parser.add_argument("--reference-pose", default="docked_rank_1",
+                        help=("label of the pose supplying the shared unbound "
+                              "reference energy; a docking run takes it from "
+                              "its best pose (default: docked_rank_1)"))
     parser.add_argument("--cpu", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--check-only", action="store_true")
@@ -464,24 +658,37 @@ def main() -> None:
     print(f"box       : centre {record['settings']['box_centre_angstrom']}, "
           f"size {record['settings']['box_size_angstrom']} A")
     print()
-    header = (f"{'pose':<22}{'rank':>5}{'RMSD/A':>10}"
-              f"{'recorded':>10}{'score()':>10}{'atoms':>7}")
+    reference = record["reference_energy"]
+    if reference.get("established"):
+        print(f"shared unbound reference: "
+              f"{reference['reference_kcal_per_mol']:.3f} kcal/mol, from "
+              f"{reference['taken_from_pose']} (component "
+              f"{UNBOUND_REFERENCE_INDEX}, confirmed empirically)")
+        print()
+
+    header = (f"{'pose':<20}{'rank':>5}{'RMSD/A':>9}{'docked':>9}"
+              f"{'specific':>10}{'shared':>9}{'resid':>8}{'ok':>4}")
     print(header)
     print("-" * len(header))
     for row in record["poses"]:
+        scores = row.get("scores", {}) or {}
+        specific = (scores.get("pose_specific") or {}).get("total_kcal_per_mol")
+        shared = (scores.get("common_reference") or {}).get("total_kcal_per_mol")
         recorded = row["provenance"].get("recorded_affinity_kcal_per_mol")
-        total = (row.get("score", {}) or {}).get("total_kcal_per_mol")
-        print(f"{row['label']:<22}"
+        reproduction = row.get("affinity_reproduction", {}) or {}
+        residual = reproduction.get("residual_kcal_per_mol")
+        ok = reproduction.get("reproduced")
+        def shown(value, places=3):
+            return "-" if value is None else f"{value:.{places}f}"
+        print(f"{row['label']:<20}"
               f"{row['provenance'].get('rank_in_file') or '-':>5}"
-              f"{row['rmsd_to_deposited_angstrom']:>10.3f}"
-              f"{'-' if recorded is None else f'{recorded:.3f}':>10}"
-              f"{'-' if total is None else f'{total:.3f}':>10}"
-              f"{row['n_heavy_atoms_mapped']:>7}")
+              f"{row['rmsd_to_deposited_angstrom']:>9.3f}"
+              f"{shown(recorded):>9}{shown(specific):>10}{shown(shared):>9}"
+              f"{shown(residual):>8}"
+              f"{('-' if ok is None else ('yes' if ok else 'NO')):>4}")
     print()
-    for row in record["poses"]:
-        probe = row.get("convention_probe")
-        if probe and probe.get("comparable"):
-            print(f"{row['label']}: {probe['interpretation']}")
+    print("specific = score() with each pose's own internal reference")
+    print("shared   = score(unbound_energy=R), the docking convention")
     print()
     print(record["uncertainty_note"])
     print(f"wrote     : {output_dir / 'rescoring.json'}")
