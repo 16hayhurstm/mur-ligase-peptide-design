@@ -151,18 +151,70 @@ class DiagnosticFixture(unittest.TestCase):
         self.ligand.parent.mkdir(parents=True, exist_ok=True)
         self.ligand.write_text(self.pdbqt_text(self.coordinates))
 
+        # The hydrogenated molfile the verification stage writes and Meeko is
+        # given. The atom map names this file, not the manifest's pre-hydrogen
+        # outputs.molfile.
+        self.molfile = self.root / "lig_withH.mol"
+        self.molfile.write_text("synthetic hydrogenated molfile\n")
+
+        self.verification = self.root / "lig.verification.json"
+        write(self.verification, {
+            "schema": "mur-ligase-ligand-verification/1",
+            "result": "passed",
+            "inputs": {
+                "ligand_manifest": str(self.ligand_manifest),
+                "ligand_manifest_sha256": provenance.file_digest_of(
+                    self.ligand_manifest),
+            },
+            "outputs": {
+                "hydrogenated_molfile": str(self.molfile),
+                "hydrogenated_molfile_sha256": provenance.file_digest_of(
+                    self.molfile),
+            },
+        })
+
+        # The real atom-map schema: it names the prepared PDBQT and the input
+        # molfile, and carries NO ligand manifest hash, because the builder
+        # never sees the manifest.
         self.atom_map = self.root / "lig.atom_map.json"
         write(self.atom_map, {
             "schema": "mur-ligase-ligand-atom-map/1",
             "inputs": {
+                "prepared_pdbqt": str(self.ligand),
                 "prepared_pdbqt_sha256": provenance.file_digest_of(self.ligand),
-                "ligand_manifest_sha256": provenance.file_digest_of(
-                    self.ligand_manifest),
+                "input_molfile": str(self.molfile),
+                "input_molfile_sha256": provenance.file_digest_of(self.molfile),
             },
             "serial_to_reference_name": {
                 str(serial): name for serial, name
                 in enumerate(sorted(self.coordinates), start=1)},
         })
+
+        # The preparation record is the anchor: the only record naming the
+        # manifest, the prepared PDBQT and the atom-map record together.
+        self.preparation = self.root / "lig.preparation.json"
+        self.write_preparation()
+
+    def write_preparation(self, **overrides):
+        inputs = {
+            "ligand_manifest": str(self.ligand_manifest),
+            "ligand_manifest_sha256": provenance.file_digest_of(
+                self.ligand_manifest),
+            "prepared_pdbqt": str(self.ligand),
+            "prepared_pdbqt_sha256": provenance.file_digest_of(self.ligand),
+            "atom_map_record": str(self.atom_map),
+            "atom_map_record_sha256": provenance.file_digest_of(self.atom_map),
+        }
+        inputs.update(overrides.pop("inputs", {}))
+        record = {
+            "schema": "mur-ligase-ligand-preparation/1",
+            "result": "passed",
+            "failure_reasons": [],
+            "component": "LIG",
+            "inputs": inputs,
+        }
+        record.update(overrides)
+        write(self.preparation, record)
 
         self.box_record = self.root / "box.json"
         write(self.box_record, {
@@ -217,7 +269,9 @@ class DiagnosticFixture(unittest.TestCase):
             component_dictionary=self.ccd,
             ligand_manifest=self.ligand_manifest,
             atom_map=self.atom_map,
-            preparation_record=None, independent_rmsd=None,
+            preparation_record=self.preparation,
+            stereo_verification=self.verification,
+            independent_rmsd=None,
             cpu=2, seed=1, max_steps=0,
             input_tolerance=diagnostic.INPUT_POSE_TOLERANCE_ANGSTROM,
             check_only=False,
@@ -241,15 +295,63 @@ class PrerequisiteTests(DiagnosticFixture):
             diagnostic.fresh_output_directory(
                 self.ligand.parent / "out", self.ligand)
 
-    def test_an_atom_map_from_a_different_pdbqt_is_refused(self):
-        record = json.loads(self.atom_map.read_text())
-        record["inputs"]["prepared_pdbqt_sha256"] = "b" * 64
-        write(self.atom_map, record)
+    def refuses(self, fragment):
         with self.assertRaises(diagnostic.DiagnosticError) as caught:
             diagnostic.run_diagnostic(self.arguments(
                 output_dir=diagnostic.fresh_output_directory(
                     self.root / "out", self.ligand)))
-        self.assertIn("does not describe this file", str(caught.exception))
+        self.assertIn(fragment, str(caught.exception))
+        self.assertEqual(StubVina.instances, [],
+                         "Vina must not be constructed once a provenance "
+                         "gate has failed")
+
+    def test_an_atom_map_naming_a_different_pdbqt_is_refused(self):
+        """The atom map's own PDBQT hash must be the file being scored."""
+        record = json.loads(self.atom_map.read_text())
+        record["inputs"]["prepared_pdbqt_sha256"] = "b" * 64
+        write(self.atom_map, record)
+        self.write_preparation()      # re-anchor, so only this field is wrong
+        self.refuses("prepared PDBQT, as named by the atom map")
+
+    def test_an_atom_map_file_the_preparation_did_not_record_is_refused(self):
+        """Substituting the atom-map file must not go unnoticed."""
+        record = json.loads(self.atom_map.read_text())
+        record["serial_to_reference_name"]["1"] = "O1"
+        write(self.atom_map, record)   # preparation still names the old digest
+        self.refuses("atom-map record does not match")
+
+    def test_a_prepared_pdbqt_the_preparation_did_not_record_is_refused(self):
+        shifted = {name: (x + 0.5, y, z)
+                   for name, (x, y, z) in self.coordinates.items()}
+        self.ligand.write_text(self.pdbqt_text(shifted))
+        self.refuses("prepared PDBQT does not match")
+
+    def test_a_missing_recorded_hash_is_refused_rather_than_skipped(self):
+        """An absent hash must fail, never pass for want of evidence."""
+        self.write_preparation(inputs={"atom_map_record_sha256": None})
+        self.refuses("This check is not optional")
+
+    def test_a_failed_preparation_record_is_refused(self):
+        self.write_preparation(result="failed",
+                               failure_reasons=["charge sum disagreed"])
+        self.refuses("not 'passed'")
+
+    def test_a_molfile_the_verification_did_not_write_is_refused(self):
+        record = json.loads(self.atom_map.read_text())
+        record["inputs"]["input_molfile_sha256"] = "c" * 64
+        write(self.atom_map, record)
+        self.write_preparation()
+        self.refuses("built from a different molfile")
+
+    def test_the_molfile_cross_check_is_recorded_as_skipped_without_a_record(self):
+        """Absent evidence is reported as absent, not as agreement."""
+        record = diagnostic.run_diagnostic(self.arguments(
+            output_dir=diagnostic.fresh_output_directory(
+                self.root / "out", self.ligand),
+            stereo_verification=None))
+        check = record["inputs"]["hydrogenated_molfile_cross_check"]
+        self.assertFalse(check["performed"])
+        self.assertNotIn("agrees", check)
 
     def test_a_drifted_ligand_manifest_is_refused(self):
         """The protonation state is read from this manifest, so identity binds."""
@@ -261,7 +363,9 @@ class PrerequisiteTests(DiagnosticFixture):
                 output_dir=diagnostic.fresh_output_directory(
                     self.root / "out", self.ligand)))
         message = str(caught.exception)
-        self.assertIn("not the one the atom map was built on", message)
+        self.assertIn("is not the one", message)
+        self.assertIn("lig.preparation.json was built on", message)
+        self.assertIn("protonation state comes from this manifest", message)
         self.assertEqual(StubVina.instances, [])
 
     def test_a_box_disagreeing_with_the_receptor_is_refused(self):
@@ -282,10 +386,14 @@ class InputPoseCheckTests(DiagnosticFixture):
         shifted = {name: (x + 1.5, y, z)
                    for name, (x, y, z) in self.coordinates.items()}
         self.ligand.write_text(self.pdbqt_text(shifted))
+        # Re-anchor every provenance hash, so the only thing wrong is the
+        # geometry: this must be caught by the coordinate check itself, not
+        # incidentally by a digest mismatch.
         record = json.loads(self.atom_map.read_text())
         record["inputs"]["prepared_pdbqt_sha256"] = \
             provenance.file_digest_of(self.ligand)
         write(self.atom_map, record)
+        self.write_preparation()
 
         with self.assertRaises(diagnostic.DiagnosticError) as caught:
             diagnostic.run_diagnostic(self.arguments(

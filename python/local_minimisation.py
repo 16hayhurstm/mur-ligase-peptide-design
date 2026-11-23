@@ -4,13 +4,23 @@ This is a **diagnostic**, not a docking experiment. It starts from the
 crystallographic ligand coordinates, asks what Vina's scoring function makes of
 them, and then lets Vina relax them locally. It answers one question:
 
-    does our receptor/ligand model make the crystallographic binding mode
-    energetically favourable under the docking model we are using?
+    is the crystallographic pose a local minimum of the model we are scoring
+    with, and what does it score there?
 
-If the deposited pose scores well and stays put, the model is sound and any
-failure to recover it is a *search* failure. If the deposited pose scores
-poorly or drifts away, the model itself disfavours the experimental mode, and
-no amount of search effort will recover it.
+**What the two outcomes do and do not license.** A pose that stays put and
+scores competitively shows that the experimental mode is a local minimum of
+this model. It does **not** show that the receptor model is scientifically
+sound, and it does not establish that the recovery failure must be due to
+conformational search: minimisation only probes the basin it starts in, so it
+cannot see that some other basin has become deeper, or that interactions
+removed during preparation would have made this basin the global optimum. A
+pose that drifts or scores poorly shows the experimental mode is not a
+minimum of this model, but does not identify which preparation choice caused
+that — the rigid receptor, the unreviewed protonation assignment, the omitted
+cofactors, the omitted waters and the scoring function all remain candidates.
+
+The result narrows the hypothesis space. It does not close it, and no single
+cause may be read off it.
 
 **What this can never be.** Local minimisation starts from the answer. It is
 not independent redocking and it cannot satisfy the project's <= 2.0 A
@@ -109,40 +119,123 @@ def fresh_output_directory(output_dir: Path, ligand: Path) -> Path:
     return output_dir
 
 
-def verified_ligand_identity(manifest_path: Path, atom_map_record: dict,
-                             prepared_pdbqt: Path) -> dict[str, object]:
-    """Check the ligand manifest's identity and tie the atom map to the PDBQT.
+def verified_ligand_identity(manifest_path: Path, preparation_path: Path,
+                             atom_map_path: Path, atom_map_record: dict,
+                             prepared_pdbqt: Path,
+                             verification_path: Path | None = None
+                             ) -> dict[str, object]:
+    """Tie the manifest, the prepared PDBQT and the atom map to one another.
 
-    Two separate questions, kept separate: whether the manifest is still the
-    one verification recorded (including the documented legacy-rewrite path),
-    and whether the atom map was built from the PDBQT we are about to score.
+    **Which record names what.** The atom map is built from the prepared PDBQT
+    and the hydrogenated molfile, and never sees the ligand manifest, so it
+    records `prepared_pdbqt_sha256` and `input_molfile_sha256` and no manifest
+    hash. The record that binds all three together is the preparation record
+    (`mur-ligase-ligand-preparation/1`), whose `inputs` name the ligand
+    manifest, the prepared PDBQT *and* the atom-map record by SHA-256. It is
+    therefore the anchor for this check, and is required.
+
+    Checked here, every one by exact digest:
+
+    1. the preparation record passed;
+    2. the ligand manifest is the one the preparation recorded, through the
+       legacy-compatible `manifest_hash_agreement` gate;
+    3. the prepared PDBQT is the one the preparation recorded;
+    4. the atom-map *file* is the one the preparation recorded;
+    5. the atom map's own recorded PDBQT is the file we are about to score.
+
+    Optionally, when a stereochemistry verification record is supplied, the
+    atom map's input molfile is checked against the hydrogenated molfile that
+    verification wrote. Note that this is **not** the ligand manifest's
+    `outputs.molfile`: the manifest's molfile is the heavy-atom form written
+    before hydrogens were added, so comparing it with the atom map's input
+    would always mismatch and would be the wrong check.
     """
+    actual_pdbqt = provenance.file_digest_of(prepared_pdbqt)
+    actual_atom_map = provenance.file_digest_of(atom_map_path)
+
+    preparation = provenance.read_manifest_like(
+        preparation_path, "mur-ligase-ligand-preparation/1")
+    if preparation.get("result") != "passed":
+        raise DiagnosticError(
+            f"{preparation_path} records result "
+            f"{preparation.get('result')!r}, not 'passed': "
+            f"{preparation.get('failure_reasons')}. The prepared ligand has "
+            f"not passed its own checks, so there is nothing to score.")
+    prepared_inputs = preparation.get("inputs", {}) or {}
+
+    # 2. manifest identity, reported by the shared gate and decided here.
     agreement = provenance.manifest_hash_agreement(
-        manifest_path,
-        (atom_map_record.get("inputs", {}) or {}).get("ligand_manifest_sha256"))
-    # `manifest_hash_agreement` reports rather than raises, so the decision is
-    # made here. Proceeding on a manifest whose identity has drifted would mean
-    # scoring one ligand while claiming the protonation state of another.
+        manifest_path, prepared_inputs.get("ligand_manifest_sha256"))
     if not agreement.get("agrees"):
         raise DiagnosticError(
-            f"the ligand manifest {manifest_path} is not the one the atom map "
-            f"was built on: {agreement.get('reason')}. Recorded "
-            f"{agreement.get('recorded_sha256')}, actual "
+            f"the ligand manifest {manifest_path} is not the one "
+            f"{preparation_path} was built on: {agreement.get('reason')}. "
+            f"Recorded {agreement.get('recorded_sha256')}, actual "
             f"{agreement.get('actual_sha256')}. The modelled protonation "
-            f"state comes from this manifest, so it must be the verified one.")
-    recorded = (atom_map_record.get("inputs", {}) or {}).get(
-        "prepared_pdbqt_sha256")
-    actual = provenance.file_digest_of(prepared_pdbqt)
-    if recorded is not None and recorded != actual:
-        raise DiagnosticError(
-            f"the atom map records prepared PDBQT {recorded} but "
-            f"{prepared_pdbqt} hashes to {actual}; the map does not describe "
-            f"this file")
+            f"state comes from this manifest, so it must be the prepared one.")
+
+    # 3, 4, 5. the three file identities, each named by a record.
+    for label, recorded, actual, path in (
+            ("prepared PDBQT", prepared_inputs.get("prepared_pdbqt_sha256"),
+             actual_pdbqt, prepared_pdbqt),
+            ("atom-map record", prepared_inputs.get("atom_map_record_sha256"),
+             actual_atom_map, atom_map_path),
+            ("prepared PDBQT, as named by the atom map",
+             (atom_map_record.get("inputs", {}) or {}).get(
+                 "prepared_pdbqt_sha256"),
+             actual_pdbqt, prepared_pdbqt)):
+        if not recorded:
+            raise DiagnosticError(
+                f"no {label} SHA-256 is recorded, so {path} cannot be tied to "
+                f"the preparation evidence. This check is not optional: "
+                f"without it the pose being scored is not demonstrably the "
+                f"prepared ligand.")
+        if recorded != actual:
+            raise DiagnosticError(
+                f"the {label} does not match: recorded {recorded}, actual "
+                f"{actual} for {path}.")
+
+    molfile_check: dict[str, object] = {
+        "performed": False,
+        "reason": "no stereochemistry verification record was supplied",
+    }
+    if verification_path is not None:
+        verification = provenance.read_manifest_like(
+            verification_path, "mur-ligase-ligand-verification/1")
+        recorded_molfile = (verification.get("outputs", {}) or {}).get(
+            "hydrogenated_molfile_sha256")
+        atom_map_molfile = (atom_map_record.get("inputs", {}) or {}).get(
+            "input_molfile_sha256")
+        if not recorded_molfile or not atom_map_molfile:
+            raise DiagnosticError(
+                f"cannot cross-check the hydrogenated molfile: verification "
+                f"records {recorded_molfile!r}, atom map records "
+                f"{atom_map_molfile!r}")
+        if recorded_molfile != atom_map_molfile:
+            raise DiagnosticError(
+                f"the atom map was built from a different molfile than "
+                f"verification wrote: atom map {atom_map_molfile}, "
+                f"verification {recorded_molfile}. The mapping would not "
+                f"describe the verified stereochemistry.")
+        molfile_check = {
+            "performed": True,
+            "hydrogenated_molfile_sha256": recorded_molfile,
+            "agrees": True,
+            "note": ("the atom map's input molfile is the hydrogenated "
+                     "molfile verification wrote, not the manifest's "
+                     "pre-hydrogen outputs.molfile"),
+        }
+
     return {
         "ligand_manifest_identity": agreement,
-        "prepared_pdbqt_sha256": actual,
-        "atom_map_recorded_pdbqt_sha256": recorded,
-        "atom_map_matches_prepared_pdbqt": recorded == actual,
+        "preparation_record_sha256": provenance.file_digest_of(preparation_path),
+        "preparation_result": preparation.get("result"),
+        "prepared_pdbqt_sha256": actual_pdbqt,
+        "atom_map_record_sha256": actual_atom_map,
+        "identity_chain": (
+            "preparation record -> ligand manifest, prepared PDBQT and "
+            "atom-map record; atom-map record -> prepared PDBQT"),
+        "hydrogenated_molfile_cross_check": molfile_check,
     }
 
 
@@ -246,7 +339,8 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, object]:
     atom_map_record = ligand_atom_map.read_atom_map(args.atom_map)
     names_by_serial = ligand_atom_map.name_by_serial(atom_map_record)
     identity = verified_ligand_identity(
-        args.ligand_manifest, atom_map_record, args.ligand)
+        args.ligand_manifest, args.preparation_record, args.atom_map,
+        atom_map_record, args.ligand, args.stereo_verification)
 
     graph, permutations, resonance, protonation_basis = \
         protonation_aware_symmetry(component, ligand_manifest)
@@ -302,12 +396,13 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, object]:
                 args.component_dictionary),
             "box_record": str(Path(args.box_record).resolve()),
             "box_record_sha256": box_geometry.file_sha256(args.box_record),
-            "preparation_record": (
-                None if args.preparation_record is None
-                else str(Path(args.preparation_record).resolve())),
-            "preparation_record_sha256": (
-                None if args.preparation_record is None
-                else box_geometry.file_sha256(args.preparation_record)),
+            "preparation_record": str(Path(args.preparation_record).resolve()),
+            "stereo_verification": (
+                None if args.stereo_verification is None
+                else str(Path(args.stereo_verification).resolve())),
+            "stereo_verification_sha256": (
+                None if args.stereo_verification is None
+                else box_geometry.file_sha256(args.stereo_verification)),
             "independent_rmsd_record": (
                 None if args.independent_rmsd is None
                 else str(Path(args.independent_rmsd).resolve())),
@@ -478,8 +573,14 @@ def main() -> None:
     parser.add_argument("--component-dictionary", type=Path, required=True)
     parser.add_argument("--ligand-manifest", type=Path, required=True)
     parser.add_argument("--atom-map", type=Path, required=True)
-    parser.add_argument("--preparation-record", type=Path, default=None,
-                        help="recorded for provenance; not required")
+    parser.add_argument("--preparation-record", type=Path, required=True,
+                        help=("the mur-ligase-ligand-preparation/1 record; it "
+                              "is the only record naming the ligand manifest, "
+                              "prepared PDBQT and atom map together, so the "
+                              "identity chain cannot be checked without it"))
+    parser.add_argument("--stereo-verification", type=Path, default=None,
+                        help=("optional; enables the hydrogenated-molfile "
+                              "cross-check against the atom map"))
     parser.add_argument("--independent-rmsd", type=Path, default=None,
                         help="recorded for provenance; not required")
     parser.add_argument("--cpu", type=int, default=2)
