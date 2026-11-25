@@ -17,8 +17,19 @@ __pycache__/
 # Local experiments and portable visualisation bundles
 /runs/
 /visualisations/
+# Peptide scoring pilot outputs. The structures inside are already covered by
+# the *.pdb/*.sdf/*.pdbqt rules above, but the JSON provenance records are
+# not, and those are the files these stages mainly write. Anchored at the
+# repository root so an examples/ or docs/ file of the same name is unaffected.
+# These are run outputs, not backups: nothing here is recoverable from Git.
+/poses/
+/ligands/
+/scores/
 *.before-group-fix
 *.bak
 .DS_Store
 # Allow intentionally maintained example YAML configurations
 !examples/*.yaml
+
+# Unpublished local research notes
+/project_private/
