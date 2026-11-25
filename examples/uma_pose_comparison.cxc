@@ -83,10 +83,18 @@ rename #6 uma_minimised
 style #3-6 stick
 size #3-6 stickRadius 0.18
 
-color #3 green            # deposited: the answer
-color #4 red              # rank 1: best score, wrong pose
-color #5 orange           # rank 7: closest retained pose
-color #6 cornflower blue  # locally minimised deposited pose
+# ChimeraX has no inline comment: `#` opens a model specifier, so a trailing
+# comment is parsed as further arguments to the command. Every comment here is
+# therefore on a line of its own, above the command it describes.
+
+# deposited: the reference pose
+color #3 green
+# rank 1: best score, wrong pose
+color #4 red
+# rank 7: closest retained pose of the apo campaign
+color #5 orange
+# locally minimised deposited pose
+color #6 cornflower blue
 
 # ---------------------------------------------------------------------------
 # 4. The recorded search box

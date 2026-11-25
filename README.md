@@ -145,6 +145,8 @@ Finally, dock across several seeds. One seed isn't a measurement: the search is 
 
 Poses and scores are written for every seed, into an output directory that must sit outside the ligand directory so docked files can't be picked up as inputs next time. It reports the seed spread next to every mean, and warns when the variation between runs is comparable to the difference between ligands. See [docs/docking_box.md](docs/docking_box.md) for the box record, the legacy mode it replaces, and the visual check.
 
+Before docking anything you care about, read the cognate-ligand control: [docs/uma_control.md](docs/uma_control.md) for the procedure and [docs/uma_control_results.md](docs/uma_control_results.md) for what two ten-seed campaigns actually found. In short, with this box and these settings, Vina does not recover the crystallographic UMA pose in the ANP-free receptor, and recovers it in most seeds when ANP is retained. Those are pose-recovery results for one small-molecule product in a simplified receptor; they are not affinities, and they say nothing about peptides.
+
 ## Quickstart
 
     ./scripts/01_fetch_structure.sh 1P3D data

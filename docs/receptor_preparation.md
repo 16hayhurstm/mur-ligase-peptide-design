@@ -36,10 +36,28 @@ python python/dock.py receptors/murc_apo_rigid.pdbqt pep dock_pilot \
 
 ## Receptor conditions
 
-| Condition | ANP | Manganese | UMA | Waters |
-| --- | --- | --- | --- | --- |
-| `apo` | absent | absent | absent | absent |
-| `anp-present` | **retained** | absent | absent | absent |
+| Condition | ANP | Manganese | UMA | Waters | Status |
+| --- | --- | --- | --- | --- | --- |
+| `apo` | absent | absent | absent | absent | archived comparison condition |
+| `anp-present` | **retained** | absent | absent | absent | **standard docking model** |
+
+**Which condition to use, decided 25 November 2026.** `anp-present` is the
+standard docking model for the peptide cohorts; `apo` is retained as an
+archived comparison condition, unmodified and available. The basis is the
+cognate-ligand control: in the 30 Å box, with ten seeds, pose recovery
+succeeded in the ANP-containing receptor and failed entirely in the ANP-free
+one — see [uma_control_results.md](uma_control_results.md) §4 and §10.
+
+This is a **modelling decision, not a validation**. It does not establish
+that peptide affinities, rankings or binding have been validated, and it does
+not validate ANP's chemistry, which remains Meeko-perceived (below) and is
+now a dependency of the standard model.
+
+**`--condition` is required and has no default**, and nothing in this
+repository hard-codes a receptor. A standard condition agreed by decision
+must still be typed into every command and must appear in every manifest and
+run record, so that a receptor prepared or docked under the other condition
+is visible as such instead of being assumed away.
 
 **UMA is removed in every condition.** It is the reaction product whose
 position defines the pocket; leaving it in the receptor would block the site
@@ -55,6 +73,35 @@ unresolved decision rather than settled by the script's default.
 **Removing ligands and metals does not produce an apo structure.** The
 coordinates remain those of the complex. An "apo receptor" here means "the
 complex with components deleted", which is not the same thing.
+
+### What was actually removed from 1P3D chain A
+
+Observed, and recorded identically in both prepared receptors' manifests:
+
+| Component | Count removed | Why |
+| --- | --- | --- |
+| UMA | 1 | the pocket-defining reaction product |
+| **Mn²⁺** | **2** | documented approximation, not a validated equivalence |
+| **HOH** | **397** | crystallographic waters removed |
+| ANP | 1, in `apo` only | ATP analogue absent in that condition |
+
+Chain B was discarded in a separate, separately labelled step; it is not a
+component removal. Residue transformations: MSE→MET on 14 residues; **KCX→LYS
+on none** — 1P3D chain A contains no carbamylated lysine, and the recorded
+count is 0. The KCX path exists and was not exercised here.
+
+**Measured, not assumed:** of these removals, the waters are the largest
+chemical change to the UMA site. Minimum distances from the 49 heavy atoms of
+deposited UMA (author A:602) to the other components of chain A are 2.54 Å for
+water (**20** water oxygens within 3.5 Å), 3.96 Å for ANP (none within 3.5 Å)
+and 4.15 Å for Mn²⁺ (none within 3.5 Å).
+
+So **manganese does not coordinate UMA in 1P3D**: the two ions coordinate
+ANP's phosphate oxygens and protein side chains. A metal-bridged carboxylate
+described in the literature concerns UNAM, the *substrate*, in a different
+structure, and must not be transferred to UMA, the product. Manganese
+omission still matters — through ANP's charge and the pocket's electrostatics
+— but not through a lost UMA contact.
 
 ## What is checked, and in what order
 
@@ -180,6 +227,57 @@ the first real preparation attempt, so Meeko reports what it cannot match
 instead of discarding it, and an incomplete pocket residue blocks the receptor
 as this project's rules require. Either flag can still be passed through
 `--meeko-argument`, and the manifest records the exact command.
+
+### What Meeko produced for ANP, observed
+
+The `anp-present` receptor exists and was used for one docking campaign, so
+what Meeko actually did to ANP is recorded here rather than left implied.
+
+Read from the receptor PDBQT, and consistent with the manifest's captured
+subprocess record:
+
+| Quantity | Value |
+| --- | --- |
+| ANP records in the receptor PDBQT | 36, all at author A:603 |
+| heavy atoms | **31** |
+| retained polar hydrogens (`HD`) | **5** |
+| summed partial charge | **−4.0000** |
+| AutoDock types | OA 12, C 5, A 5, NA 4, HD 5, P 3, N 2 |
+| receptor heavy atoms | 3578, i.e. 3547 + 31, agreeing with the manifest |
+
+ANP matched **no packaged Meeko template**. The captured stderr reads
+
+```
+RuntimeWarning: Input residues {'A:603': 'ANP'} not in residue_templates
+```
+
+and Meeko then built a chemical template of its own from a hydrogen-free PDB.
+Its bond orders, protonation and −4 formal charge are therefore **perceived
+by the tool, not evidenced**. The hydrogen pattern is consistent with the
+neutral CCD entry with the four phosphate acids deprotonated — the same
+convention applied to the UMA ligand, which makes the two consistent rather
+than independently corroborated.
+
+> **This is a plausible working representation of ANP. It is not an
+> independently validated ANP parameterisation.** Nothing here establishes
+> that the atom types, the partial charges or the protonation are right for
+> this cofactor at this site.
+
+Two further consequences, recorded so they are not rediscovered:
+
+- the retained ANP carries its full −4 inside the search box while the two
+  Mn²⁺ ions that are inner-sphere coordinated to its phosphates in the
+  deposited structure have been deleted, so the local charge balance of the
+  model is not that of the crystal;
+- the Meeko **version is not captured** in either manifest: the recorded
+  entry is the first line of `mk_prepare_receptor.py --help`, which is a
+  usage line. "Meeko 0.7.1" comes from [environment.md](environment.md), not
+  from a record. Both existing receptors were prepared by a tool of
+  unrecorded version; this cannot be fixed retrospectively.
+
+Anything obtained with this receptor is conditional on the above. See
+[uma_control_results.md](uma_control_results.md) for the campaign that used
+it and for how its result is scoped.
 
 **Template support alone does not establish that ANP preparation works.**
 That a flag exists for assigning templates says nothing about whether a

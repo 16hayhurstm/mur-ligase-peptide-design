@@ -37,9 +37,15 @@ What this cannot establish
 Recovering the deposited pose shows that this box, this receptor and these
 search settings can place the cognate ligand where the crystal has it. It does
 not establish that peptide poses or peptide rankings are reliable, and it is
-not an affinity measurement. The receptor used for the initial control has
-neither ANP nor manganese, so a recovery is **recovery in the simplified
-receptor, not validation against the native state**.
+not an affinity measurement.
+
+What the receptor contained is **read from the campaign's own
+`run_record.json`**, never assumed. Both prepared conditions remove UMA, the
+two manganese ions and the crystallographic waters, so neither is the native
+state; `anp-present` additionally depends on ANP's Meeko-perceived chemistry.
+`receptor_condition_limits` states the condition-specific limits, and an
+analysis of a campaign whose record names no condition says nothing about the
+receptor's composition at all.
 """
 from __future__ import annotations
 
@@ -496,6 +502,97 @@ def pose_linkage(atom_map_record: dict, run_record: dict,
     }
 
 
+def receptor_condition_limits(condition: str | None) -> list[str]:
+    """Return the interpretation limits that depend on the receptor's contents.
+
+    The receptor condition is read from the docking run's own
+    `run_record.json`, which copies it from the receptor manifest. It is not
+    assumed: an analysis of an `anp-present` campaign must not print that the
+    receptor has no ANP, and an analysis of a campaign with no recorded
+    condition must not describe the receptor's composition at all.
+
+    Parameters
+    ----------
+    condition:
+        The recorded receptor condition, as written by
+        `prepare_receptor.py` (`"apo"` or `"anp-present"`), or `None` when the
+        campaign record does not state one.
+
+    Returns
+    -------
+    A list of prose limitations, most specific first. Every branch states the
+    removals that are common to both prepared conditions - UMA, the two
+    manganese ions and the crystallographic waters - except the unknown
+    branch, which states nothing about composition because nothing is known.
+
+    Limitations
+    -----------
+    These are statements about what was removed from or retained in the
+    receptor, not an assessment of the chemistry of what remains. An
+    unrecognised condition string is treated like a missing one.
+    """
+    common_removals = (
+        "UMA, the two manganese ions and the 397 crystallographic waters of "
+        "the selected chain were removed. The 20 water oxygens within 3.5 A "
+        "of the deposited ligand are the largest chemical change to the UMA "
+        "site itself; neither manganese ion nor any ANP atom lies within "
+        "3.5 A of deposited UMA")
+    if condition == "apo":
+        return [
+            "the recorded receptor condition is 'apo': ANP is absent, and "
+            f"{common_removals}. A recovery is recovery in the simplified "
+            "receptor, not validation against the native state",
+            "the ANP-present condition is a second condition, not a "
+            "replicate: ANP occupies part of the search box, so it poses a "
+            "different search problem with a different expected answer",
+        ]
+    if condition == "anp-present":
+        return [
+            "the recorded receptor condition is 'anp-present': ANP is "
+            f"retained, and {common_removals}. A recovery is recovery in a "
+            "receptor that is still simplified, not validation against the "
+            "native state",
+            "ANP's atom types, partial charges and protonation were built by "
+            "Meeko from a perceived chemical template rather than matched to "
+            "a packaged one, and have not been independently validated for "
+            "this project. A result obtained in this condition depends on "
+            "that unvalidated cofactor representation",
+            "the two manganese ions removed here are inner-sphere "
+            "coordinated to ANP's phosphates in the deposited structure, so "
+            "the retained ANP carries its full formal negative charge with "
+            "the neutralising metals absent",
+            "this condition is not a replicate of the apo condition: the "
+            "two differ in the contents of the search box, so a difference "
+            "between them is an effect of the receptor condition and not an "
+            "estimate of run-to-run variability",
+        ]
+    return [
+        "the campaign record states no receptor condition, so this analysis "
+        "cannot say what the receptor contained. Do not describe it as "
+        "ANP-free or ANP-containing without reading the receptor manifest",
+    ]
+
+
+def receptor_condition_sentence(condition: str | None) -> str:
+    """Return the closing console note, matched to the receptor condition."""
+    if condition == "apo":
+        return ("Recovery here is recovery in the simplified 'apo' receptor "
+                "(no ANP, no manganese, no waters).\nIt is not validation "
+                "against the native state, and it says nothing about\npeptide "
+                "affinity.")
+    if condition == "anp-present":
+        return ("Recovery here is recovery in the 'anp-present' receptor: ANP "
+                "retained, manganese and\nwaters absent, and ANP's chemistry "
+                "perceived by Meeko rather than validated.\nIt is not "
+                "validation against the native state, it is not a replicate "
+                "of the apo\ncondition, and it says nothing about peptide "
+                "affinity.")
+    return ("The campaign record states no receptor condition, so the "
+            "receptor's contents cannot\nbe read from this analysis. Read the "
+            "receptor manifest before describing it.\nIn no condition does "
+            "this control say anything about peptide affinity.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -697,9 +794,7 @@ def run(args: argparse.Namespace) -> None:
             "are reliable",
             "a docking score is not a measured affinity, and these scores are "
             "not thresholds for peptides",
-            "the initial control receptor has neither ANP nor manganese, so "
-            "this is recovery in the simplified receptor, not validation "
-            "against the native state",
+            *receptor_condition_limits(docking_context.get("receptor_condition")),
             "the reference is one crystallographic conformer, and the pocket "
             "side chains are those adopted with this ligand bound",
         ],
@@ -776,9 +871,8 @@ def run(args: argparse.Namespace) -> None:
         print("pass and a failure equally uninformative. Supply")
         print("--stereo-verification and --independent-rmsd once done.")
         print("=" * 70)
-    print("\nRecovery here is recovery in the simplified receptor (no ANP, no "
-          "manganese).\nIt is not validation against the native state, and it "
-          "says nothing about\npeptide affinity.")
+    print("\n" + receptor_condition_sentence(
+        docking_context.get("receptor_condition")))
 
 
 def _score(value: float | None) -> str:

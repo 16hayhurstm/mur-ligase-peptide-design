@@ -604,6 +604,92 @@ HETATM 14 O "O3'" . LIG C 2 . ? 49.300 1.200 0.000 1.00 10.00 602 B 1
 
 
 @unittest.skipUnless(GEMMI_AVAILABLE, "these stages require Gemmi")
+class ReceptorConditionInterpretationTests(unittest.TestCase):
+    """The interpretation text must follow the recorded receptor condition.
+
+    These are wording checks, deliberately. The defect they guard against was
+    a factual claim - "the receptor has neither ANP nor manganese" - printed
+    unconditionally, including for a campaign whose own record said ANP was
+    retained. What matters is therefore which condition each branch describes,
+    not the prose style, so each assertion names the substantive claim it
+    requires or forbids.
+    """
+
+    def test_apo_states_anp_is_absent(self):
+        limits = analyse_redocking.receptor_condition_limits("apo")
+        joined = " ".join(limits)
+        self.assertIn("'apo'", joined)
+        self.assertIn("ANP is absent", joined)
+        self.assertNotIn("ANP is retained", joined)
+
+    def test_anp_present_never_claims_the_receptor_lacks_anp(self):
+        limits = analyse_redocking.receptor_condition_limits("anp-present")
+        joined = " ".join(limits)
+        self.assertIn("ANP is retained", joined)
+        self.assertNotIn("ANP is absent", joined)
+        self.assertNotIn("neither ANP nor manganese", joined)
+
+    def test_anp_present_records_that_anp_chemistry_is_unvalidated(self):
+        # Retaining ANP makes Meeko's perceived typing and charges part of the
+        # result, so the limitation has to travel with the condition.
+        joined = " ".join(
+            analyse_redocking.receptor_condition_limits("anp-present"))
+        self.assertIn("Meeko", joined)
+        self.assertIn("not been independently validated", joined)
+
+    def test_both_conditions_state_the_shared_removals(self):
+        for condition in ("apo", "anp-present"):
+            joined = " ".join(
+                analyse_redocking.receptor_condition_limits(condition))
+            with self.subTest(condition=condition):
+                self.assertIn("manganese", joined)
+                self.assertIn("397 crystallographic waters", joined)
+                self.assertIn("not validation against the native state",
+                              joined)
+
+    def test_neither_condition_is_called_a_replicate_of_the_other(self):
+        for condition in ("apo", "anp-present"):
+            joined = " ".join(
+                analyse_redocking.receptor_condition_limits(condition))
+            with self.subTest(condition=condition):
+                self.assertIn("not a", joined)
+                self.assertIn("replicate", joined)
+
+    def test_an_unrecorded_condition_describes_no_composition(self):
+        for condition in (None, "", "something-else"):
+            limits = analyse_redocking.receptor_condition_limits(condition)
+            joined = " ".join(limits)
+            with self.subTest(condition=condition):
+                self.assertIn("states no receptor condition", joined)
+                self.assertNotIn("ANP is absent", joined)
+                self.assertNotIn("ANP is retained", joined)
+
+    def test_no_unconditional_claim_about_the_receptor_remains(self):
+        """Guard the defect itself: a composition claim outside the branches.
+
+        This reads the module's source rather than its behaviour, because the
+        defect was one sentence asserted on every path, and the wording is
+        what made it wrong. The phrase is now spoken only by the apo branch,
+        which the tests above check, so its reappearance anywhere in the
+        module is the regression.
+        """
+        source = Path(analyse_redocking.__file__).read_text()
+        self.assertNotIn("neither ANP nor manganese", source)
+
+    def test_the_closing_sentence_follows_the_condition_too(self):
+        apo = analyse_redocking.receptor_condition_sentence("apo")
+        anp = analyse_redocking.receptor_condition_sentence("anp-present")
+        unknown = analyse_redocking.receptor_condition_sentence(None)
+        self.assertIn("no ANP", apo)
+        self.assertIn("ANP retained", anp)
+        self.assertNotIn("no ANP", anp)
+        self.assertIn("no receptor condition", unknown)
+        # Whatever the receptor held, the control is silent on affinity.
+        for sentence in (apo, anp, unknown):
+            self.assertIn("peptide", sentence)
+            self.assertIn("affinity", sentence)
+
+
 class DictionaryAndReferenceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

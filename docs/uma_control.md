@@ -5,7 +5,13 @@ these search settings put UMA where the crystal has it? It tests the docking
 setup, not the biology, and either answer is useful. A failure would be strong
 evidence against using the setup for peptides.
 
-Nothing in this document has been docked yet.
+This document is the **procedure**. The campaigns that have now been run, and
+what they found, are recorded separately in
+[uma_control_results.md](uma_control_results.md): two ten-seed campaigns in
+the 30 Å box, one per receptor condition, both on the **−2** ligand — which
+this document designates the *sensitivity* state, not the primary one (see
+"Protonation" below). Settings, thresholds and the measure described here were
+fixed before those runs and are unchanged by them.
 
 ## What UMA is
 
@@ -183,6 +189,21 @@ it was only ever done when it was least informative.
 
 Reading the Jancan & Macnaughtan values remains worth doing and would narrow
 the question, but it does not replace the sensitivity run.
+
+**Both ten-seed campaigns were run on −2, the sensitivity state.** That is
+recorded, not corrected: see
+[uma_control_results.md](uma_control_results.md) §7. The designation above
+stands as written — −3 primary, −2 sensitivity — and whether to re-designate
+−2 with reasons recorded, or to repeat the paired comparison at −3, is an
+open decision. Reporting a sensitivity-state result as the primary one is
+what must not happen.
+
+The distinction also has a measurement consequence, which is why the two
+states cannot be used interchangeably: the resonance-normalised heavy-atom
+graph has **8** automorphisms at −3 (O1A/O2A, O1B/O2B and O19/O20
+interchangeable) and **4** at −2, because the protonated β-phosphate's
+O1B/O2B pair is correctly *not* equivalent. An RMSD is therefore only
+meaningful alongside the state it was computed for.
 
 The same treatment is what Meeko applied to ANP in the receptor — neutral
 dictionary entry, all four phosphate acids deprotonated, total −4. That
@@ -922,12 +943,27 @@ naming what is outstanding. An unverified stereoisomer or an unvalidated RMSD
 implementation makes a pass and a failure equally uninformative, so the
 numbers are not evidence either way until both are supplied.
 
-Interpretation limits, which the analysis record also carries:
+**The interpretation limits follow the receptor condition, and are not
+assumed.** `analyse_redocking.py` reads `receptor_condition` from the
+campaign's own `run_record.json` and writes the matching limits into
+`interpretation_limits`:
 
-- The initial control receptor has **neither ANP nor manganese**. A recovery is
-  **recovery in the simplified receptor, not validation against the native
-  state.** In deposited 1P3D, UMA, ANP and two Mn²⁺ **coexist**: they occupy
-  adjacent sub-sites of one composite site. Their proximity (UMA and ANP come
+| Recorded condition | What the analysis states |
+| --- | --- |
+| `apo` | ANP is absent; UMA, the two Mn²⁺ and the 397 waters were removed; the ANP-present condition is a second condition, not a replicate |
+| `anp-present` | ANP is **retained**; UMA, Mn²⁺ and the waters were removed; ANP's typing, charges and protonation are Meeko-perceived and unvalidated; ANP's −4 sits in the box with the neutralising metals absent; this is not a replicate of `apo` |
+| none recorded | nothing about the receptor's composition — read the receptor manifest instead |
+
+Before this was wired to the record, the analysis printed "the receptor has
+neither ANP nor manganese" on every path, including for `anp-present`
+campaigns. Re-running the analysis on an existing run directory regenerates
+the record and changes no pose, score or RMSD.
+
+Interpretation limits common to every condition, which the analysis record
+also carries:
+
+- No prepared condition is the native state. In deposited 1P3D, UMA, ANP and
+  two Mn²⁺ **coexist**: they occupy adjacent sub-sites of one composite site. Their proximity (UMA and ANP come
   within 3.96 Å) is **not** evidence of competition or steric conflict —
   nothing is competing in a structure where all of them are bound at once. It
   means the simplified receptor is missing neighbours that the deposited pose
@@ -936,6 +972,18 @@ Interpretation limits, which the analysis record also carries:
   replicate**. ANP occupies part of the search box, which changes the search
   problem; that is a different experiment with a different expected answer,
   and it requires the cofactor's chemical state to have been reviewed first.
+- **Waters, not the cofactors, are the largest deletion from the UMA site
+  itself.** 20 water oxygens of chain A lie within 3.5 Å of deposited UMA,
+  while no ANP or Mn²⁺ atom does; the nearest are 3.96 Å and 4.15 Å away.
+  Manganese coordinates ANP's phosphates and protein side chains in this
+  structure, **not UMA**. All 397 waters are removed in every condition, so
+  this limits both conditions equally and does not confound a comparison
+  between them.
+- The reference is **one of two observed conformers**. The second deposited
+  UMA copy differs by 1.141 Å overall and by ~1.9 Å mean, 4.66 Å maximum in
+  the lactyl–alanine fragment. The predefined reference and the 2.0 Å
+  criterion are unchanged by that observation; measuring poses against the
+  second copy is an open investigation, not an alternative endpoint.
 - Recovering the deposited pose does not establish that peptide poses or
   rankings are reliable. It removes one failure mode.
 - **UMA scores are not affinity thresholds for peptides.** UMA is a 49-heavy-atom
@@ -951,14 +999,16 @@ Interpretation limits, which the analysis record also carries:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-287 tests, 5 of which require RDKit and skip without it. What they do and
-do not establish, kept apart deliberately:
+**421 tests** across the whole suite, of which 5 require RDKit and skip
+without it and 1 requires RDKit's absence. What they do and do not establish,
+kept apart deliberately:
 
 | Suite | Needs | Covers |
 | --- | --- | --- |
 | `tests/test_uma_control.py` | nothing / Gemmi | the molecular graph, resonance normalisation restricted to deprotonated groups, automorphism enumeration, in-place RMSD, pose-file parsing, the recovery logic, dictionary reading, reference extraction, both ligand stages and the stereo plan |
+| `tests/test_uma_control.py::ReceptorConditionInterpretationTests` | nothing | that the interpretation limits and the closing console note follow the **recorded** receptor condition: `apo` says ANP is absent, `anp-present` never says the receptor lacks ANP and always carries ANP's unvalidated-chemistry caveat, an unrecorded condition describes no composition, and the old unconditional sentence is gone from the module |
 | `tests/test_ligand_verification.py` | nothing / Gemmi | the index-to-name correspondence derived from coordinates and every way it can be ambiguous, the raw molfile bond-order reader, bond-order vocabulary normalisation, element and connectivity validation, the per-centre stereochemistry comparison including the carbon/phosphorus separation, the heavy-atom check after hydrogen addition, the failure record, the downstream validation of a verification record, and the five input-identity guards run end to end |
-| `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule in both the charged and the neutral form. **Skipped without RDKit, so never executed on the Mac** |
+| `tests/test_ligand_verification.py::RdkitRepresentationTests` | **RDKit** | the Kekulé/aromatic regression, that the previous comparison would have disagreed, that a genuinely changed bond is still rejected, and that modelled charges reach the expected molecule in both the charged and the neutral form. Skipped wherever RDKit is absent. They now run in the Mac venv, which has RDKit 2026.03.3 |
 | `tests/test_ligand_atom_map.py` | nothing | the Meeko index map: direction derivation including the ambiguous and immaterial cases, reordered atoms, missing and duplicate entries, a map from the wrong input, merged hydrogens, the record's tie to its PDBQT by hash, and the campaign-provenance linkage for docked poses |
 | `tests/test_ligand_verification.py::ChargeConsistencyTests` | nothing / Gemmi | that a negative charge is only accepted on an atom bearing an acidic proton, reported with the atom's name and bonds rather than RDKit's atom index |
 | `tests/test_ligand_verification.py::RdkitAbsenceTests` | RDKit **absent** | the diagnostic given when RDKit is missing. Skips wherever RDKit is installed |
@@ -969,8 +1019,8 @@ absence. Exactly one of the two groups runs anywhere:
 
 | Machine | Ran | Skipped | Which |
 | --- | --- | --- | --- |
-| Mac (no RDKit) | 287 | 5 | the five `RdkitRepresentationTests` |
-| Epicac (`boltz`, RDKit present) | 287 | **1** | `RdkitAbsenceTests` only |
+| a Mac without RDKit | 421 | 5 | the five `RdkitRepresentationTests` |
+| any machine with RDKit — including the current Mac venv, which has RDKit 2026.03.3 — and Epicac's `boltz` | 421 | **1** | `RdkitAbsenceTests` only |
 
 An Epicac run reporting more than one skip means something else is being
 skipped and is worth reading: before this revision, five `InputGuardTests`
@@ -982,9 +1032,11 @@ path, which is now fixed by generating the fixtures in the test.
 `rdCIPLabeler.AssignCIPLabels`, `AddHs(addCoords=True)` and `MolToMolFile`
 are reached only through the thin adapter in `verify_ligand_rdkit.py`. The
 four `RdkitRepresentationTests` do exercise the expected-molecule
-construction and the representation comparison, but **they skip on the
-development machine and were written without ever being run**, so on Epicac
-they are themselves a first execution rather than a passing guarantee. There
+construction and the representation comparison. They were **written without
+ever being run** and skipped on the development machine of the time; they now
+execute in the Mac venv (RDKit 2026.03.3) and pass there. Epicac's `boltz`
+RDKit is a different build, so its first run there is still an integration
+check in its own right rather than a guarantee carried over. There
 is deliberately **no RDKit stub** — stubbing stereochemistry perception would
 assert chemistry that nothing in the suite can check, and could hide an
 interface error instead of revealing one.
@@ -999,9 +1051,10 @@ without RDKit then produces a `result: "failed"` record naming the missing
 dependency, writes no hydrogenated molfile, and exits non-zero, so the gating
 behaviour is tested even though the chemistry is not.
 
-The first real execution of the RDKit path will therefore be on Epicac. Treat
-its first run as an integration check in its own right: read the console
-output and the record before trusting either.
+Treat the first run of this path on any newly introduced RDKit build as an
+integration check in its own right: read the console output and the record
+before trusting either. Passing in the Mac venv does not transfer to Epicac's
+build, and a Meeko-dependent step is not covered on the Mac at all.
 
 **`index_to_name_correspondence.equals_file_order` is diagnostic, not a pass
 requirement.** The correspondence that matters is the one the script derives
